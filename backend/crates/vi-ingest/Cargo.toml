@@ -13,13 +13,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde.workspace = true
 sha2 = "0.10"
 regex = "1"
-serde_yaml = "0.9"
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 flate2 = "1"
 csv = "1"
 url = "2"
 tar = "0.4"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+scraper = { version = "0.27", default-features = false }
 
 [[bin]]
 name = "vi-worker"

@@ -1,3 +1,4 @@
+import {useIdentity,permits} from "./identity";
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
@@ -755,10 +756,11 @@ export function Actors({
   const { data, error, isPending } = useQuery({
     queryKey: ["actors"],
     queryFn: async () => {
-      const first = await api<{results:Actor[];total:number}>("/api/threat-actors",{limit:1000});
+      const first = await api<{results:Actor[];total:number}>("/api/threat-actors",{limit:100});
       const results = [...first.results];
       while(results.length < first.total){
-        const page = await api<{results:Actor[]}>("/api/threat-actors",{limit:1000,skip:results.length});
+        if(results.length>=10000)throw new Error("Actor catalog exceeds the 10,000-record view budget.");
+        const page = await api<{results:Actor[]}>("/api/threat-actors",{limit:100,skip:results.length});
         if(!page.results.length)break;
         results.push(...page.results);
       }
@@ -1241,6 +1243,7 @@ interface Analysis {
   trust: string;
 }
 export function Workbench({ onSelect }: SelectProps) {
+  const {data:identity}=useIdentity();
   const [tab, setTab] = useState("Analyze SBOM");
   const [text, setText] = useState("");
   const [parseError, setParseError] = useState("");
@@ -1255,7 +1258,7 @@ export function Workbench({ onSelect }: SelectProps) {
   const qc = useQueryClient();
   const { data: vex } = useQuery({
     queryKey: ["vex"],
-    queryFn: () => api<{ results: unknown[] }>("/api/v2/vex"),
+    queryFn: () => api<{ results: unknown[]; truncated?: boolean }>("/api/v2/vex"),
   });
   const analyze = useMutation({
     mutationFn: (doc: unknown) =>
@@ -1312,7 +1315,7 @@ export function Workbench({ onSelect }: SelectProps) {
             {t}
           </button>
         ))}
-        <span>{vex?.results.length || 0} saved statements</span>
+        <span>{vex?.results.length || 0}{vex?.truncated ? "+" : ""} saved documents</span>
       </nav>
       {tab === "Analyze SBOM" ? (
         <>
@@ -1320,7 +1323,7 @@ export function Workbench({ onSelect }: SelectProps) {
             <div className="panel-header">
               <div>
                 <h2>What’s in your software?</h2>
-                <p>Upload CycloneDX or SPDX JSON, or paste it below.</p>
+                <p>Upload CycloneDX or SPDX JSON, or paste it below. Analysis sends package names and versions to the public OSV service.</p>
               </div>
               <button
                 className="button secondary"
@@ -1389,11 +1392,11 @@ export function Workbench({ onSelect }: SelectProps) {
             <div className="sbom-actions">
               <span>
                 <ShieldCheck size={15} />
-                Processed by your local API
+                {permits(identity,"analyze")?"Processed by your local API":"Your role does not permit analysis"}
               </span>
               <button
                 className="button primary"
-                disabled={!text.trim() || analyze.isPending}
+                disabled={!permits(identity,"analyze") || !text.trim() || analyze.isPending}
                 onClick={run}
               >
                 {analyze.isPending ? "Analyzing…" : "Analyze dependencies"}
@@ -1562,7 +1565,7 @@ export function Workbench({ onSelect }: SelectProps) {
                 Saved locally as an unsigned analyst statement. Signing and
                 publisher trust validation require a production integration.
               </div>
-              <button className="button primary" disabled={save.isPending}>
+              <button className="button primary" disabled={!permits(identity,"vex:write") || save.isPending}>
                 {save.isPending ? "Saving…" : "Save OpenVEX statement"}
                 <ShieldCheck size={15} />
               </button>
@@ -1607,17 +1610,18 @@ export function Workbench({ onSelect }: SelectProps) {
 }
 
 export function Sources() {
- const qc=useQueryClient();const {data,error}=useQuery({queryKey:['stats'],queryFn:()=>api<Stats>('/api/stats/'),refetchInterval:10000});
+ const {data:identity}=useIdentity();
+ const qc=useQueryClient();const {data,error}=useQuery({queryKey:['stats'],queryFn:()=>api<Stats>('/api/stats/'),refetchInterval:10000,enabled:permits(identity,'ingest')});
  const sync=useMutation({mutationFn:(source:string)=>api<{queued:boolean}>('/api/admin/ingest',{source}),onSuccess:()=>qc.invalidateQueries({queryKey:['stats']})});
- const {data:jobs}=useQuery({queryKey:['ingestion-jobs'],queryFn:()=>api<{results:{id:number;source_name:string;status:string;detail:string|null}[]}>('/api/admin/jobs'),refetchInterval:10000});
- return <><PageHeading title="Data sources" description="Public intelligence, traceable evidence, and continuous ingestion."/><div className="source-banner"><Database size={25}/><div><h2>Intelligence starts at the source.</h2><p>{data?.total||0} CVEs ingested. Each connector records its last successful run, source evidence, and failures.</p></div><Badge tone="blue">Open-source stack</Badge></div>{sync.error&&<ErrorBox error={sync.error}/>} {sync.data&&<div className="note"><Check size={15}/>{sync.data.queued?'Sync queued. The worker will pick it up.':'A sync is already queued or running.'}</div>}<section className="panel">{error?<ErrorBox error={error}/>:!data?<Loading/>:<div className="source-list">{data.sources.map(source=><div className="source-row" key={source.source_name}><div className="source-logo"><Database size={20}/></div><div className="source-details"><h3>{source.source_name}</h3><p>{source.last_success_at?`Last success ${new Date(source.last_success_at).toLocaleString()}`:'Awaiting first successful ingestion'} · {source.records||0} records in last run</p>{source.last_error&&<p className="form-error">{source.last_error}</p>}{source.configuration_required&&<p>{source.configuration_required}</p>}</div><Badge tone={source.status==='Healthy'?'success':source.status==='Error'?'danger':'neutral'}>{source.status}</Badge><button className="button secondary" disabled={sync.isPending||source.status==='Running'} onClick={()=>sync.mutate(source.source_name)}>Sync now</button></div>)}</div>}</section>{jobs?.results.length? <section className="panel connector-instructions"><h2>Recent ingestion jobs</h2>{jobs.results.slice(0,12).map(job=><div className="note" key={job.id}><span>{job.source_name}</span><Badge>{job.status}</Badge>{job.detail&&<span>{job.detail}</span>}</div>)}</section>:null}<div className="panel connector-instructions"><h2>Continuous source reconciliation</h2><p>The worker runs independently of the API. PostgreSQL commits each page and checkpoint together, and API queries see committed changes immediately.</p><p className="muted small">A failed or blocked upstream source remains visible here. No demonstration records are substituted. Vendor VEX imports require a configured publisher verification process.</p></div></>;
+ const {data:jobs}=useQuery({queryKey:['ingestion-jobs'],queryFn:()=>api<{results:{id:number;source_name:string;status:string;detail:string|null}[]}>('/api/admin/jobs'),refetchInterval:10000,enabled:permits(identity,'ingest')});
+ return <><PageHeading title="Data sources" description="Public intelligence, traceable evidence, and continuous ingestion."/><div className="source-banner"><Database size={25}/><div><h2>Intelligence starts at the source.</h2><p>{data?.total||0} CVEs ingested. Each connector records its last successful run, source evidence, and failures.</p></div><Badge tone="blue">Open-source stack</Badge></div>{sync.error&&<ErrorBox error={sync.error}/>} {sync.data&&<div className="note"><Check size={15}/>{sync.data.queued?'Sync queued. The worker will pick it up.':'A sync is already queued or running.'}</div>}<section className="panel">{error?<ErrorBox error={error}/>:!data?<Loading/>:<div className="source-list">{data.sources.map(source=><div className="source-row" key={source.source_name}><div className="source-logo"><Database size={20}/></div><div className="source-details"><h3>{source.source_name}</h3><p>{source.last_success_at?`Last success ${new Date(source.last_success_at).toLocaleString()}`:'Awaiting first successful ingestion'} · {source.records||0} records in last run</p>{source.last_error&&<p className="form-error">{source.last_error}</p>}{source.configuration_required&&<p>{source.configuration_required}</p>}{source.coverage&&<p>{source.coverage}</p>}</div><Badge tone={source.status==='Healthy'?'success':source.status==='Error'?'danger':'neutral'}>{source.status}</Badge><button className="button secondary" disabled={!permits(identity,'ingest')||sync.isPending||source.status==='Running'} onClick={()=>sync.mutate(source.source_name)}>Sync now</button></div>)}</div>}</section>{jobs?.results.length? <section className="panel connector-instructions"><h2>Recent ingestion jobs</h2>{jobs.results.slice(0,12).map(job=><div className="note" key={job.id}><span>{job.source_name}</span><Badge>{job.status}</Badge>{job.detail&&<span>{job.detail}</span>}</div>)}</section>:null}<div className="panel connector-instructions"><h2>Continuous source reconciliation</h2><p>The worker runs independently of the API. PostgreSQL commits each page and checkpoint together, and API queries see committed changes immediately.</p><p className="muted small">A failed or blocked upstream source remains visible here. No demonstration records are substituted. Vendor VEX imports require a configured publisher verification process.</p></div></>;
 }
 export function Developer() {
   const [mcpCopied, setMcpCopied] = useState(false);
   const [mcpCopyError, setMcpCopyError] = useState(false);
   const localDev = import.meta.env.DEV && ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
   const mcpUrl = localDev ? "http://127.0.0.1:8080/api/mcp" : `${window.location.origin}/api/mcp`;
-  const mcpConfig = JSON.stringify({mcpServers: {sentinel: {type: "http", url: mcpUrl, headers: {Authorization: "Bearer <VI_API_TOKEN>"}}}}, null, 2);
+  const mcpConfig = JSON.stringify({mcpServers: {sentinel: {type: "http", url: mcpUrl, headers: {Authorization: "Bearer <SCOPED_CLIENT_TOKEN>"}}}}, null, 2);
   const [copied, setCopied] = useState(false);
   const example =
     'curl -X POST http://localhost:8080/api/v2/vulnerabilities/filter \\\n  -H "Content-Type: application/json" \\\n  -d \'{"conditions":[{"field":"seen_wild","operator":"eq","value":true}],"limit":10}\'';
@@ -1660,7 +1664,7 @@ export function Developer() {
           }}>{mcpCopied ? <Check size={15}/> : <Copy size={15}/>} {mcpCopied ? "Copied" : "Copy MCP config"}</button>
         </div>
         <p><Badge tone="blue">Streamable HTTP</Badge> <code>{mcpUrl}</code></p>
-        <p>In your assistant’s MCP settings, add this server URL and set the Authorization header to <code>Bearer &lt;VI_API_TOKEN&gt;</code>. Use the operator token from your deployment’s environment. Replace the placeholder privately in your client.</p>
+        <p>In your assistant’s MCP settings, add this server URL and set the Authorization header to <code>Bearer &lt;SCOPED_CLIENT_TOKEN&gt;</code>. Create an expiring client credential with the read scope using the deployment’s client-token utility. Replace the placeholder privately in your client. The operator token grants full administration.</p>
         <pre><code>{mcpConfig}</code></pre>
         {mcpCopyError && <p role="alert">Copy was unavailable. Select and copy the configuration above.</p>}
         <p className="muted small">Configuration keys vary by client. Supports MCP 2025-03-26, 2025-06-18 and 2025-11-25. Clients must support one of these versions and bearer headers; OAuth-only connectors need an authentication gateway.</p>

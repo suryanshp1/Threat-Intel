@@ -1,3 +1,8 @@
+import {useIdentity} from "./identity";
+import {AuditManagement} from "./audit";
+import { logoutSession } from "./session";
+import { TourWelcome, UserTour } from "./tour";
+import { hasSeenTour, rememberTour } from "./tour-data";
 import { useState, useEffect, useRef } from "react";
 import {
   NavLink,
@@ -12,6 +17,7 @@ import {
   BookOpen,
   ChevronsUpDown,
   CircleHelp,
+  Compass,
   Database,
   Fingerprint,
   Globe2,
@@ -51,7 +57,9 @@ const navigation = [
   { label: "Supply chain", path: "/vi/supply-chain", icon: Package },
 ];
 export default function App() {
+  const {data:identity}=useIdentity();
   const [authRequired,setAuthRequired]=useState(false);
+  const [logoutError,setLogoutError]=useState("");
   useEffect(()=>{const onAuth=()=>setAuthRequired(true);window.addEventListener("sentinel-auth-required",onAuth);return()=>window.removeEventListener("sentinel-auth-required",onAuth)},[]);
   const [mobile, setMobile] = useState(false);
   const [compact, setCompact] = useState(() => window.matchMedia("(max-width: 760px)").matches);
@@ -60,6 +68,22 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [watchOpen, setWatchOpen] = useState(false);
+  const [tourActive, setTourActive] = useState(false);
+  const tourTrigger = useRef<HTMLButtonElement>(null);
+  useEffect(() => { if (authRequired) setTourActive(false); }, [authRequired]);
+  const [tourWelcome, setTourWelcome] = useState(() => {
+    try { return !hasSeenTour(window.localStorage); } catch { return true; }
+  });
+  const dismissTourWelcome = () => {
+    setTourWelcome(false);
+    try { rememberTour(window.localStorage); } catch { /* Storage may be blocked. */ }
+  };
+  const startTour = () => {
+    dismissTourWelcome();
+    setMobile(false);
+    setWatchOpen(false);
+    setTourActive(true);
+  };
   const [watch] = useStored<string[]>("sentinel-watchlist", []);
   const navigate = useNavigate();
   const location = useLocation();
@@ -110,6 +134,7 @@ export default function App() {
       { label: "SBOM & VEX", path: "/vi/tools/sbom-vex" },
       { label: "Data sources", path: "/vi/sources" },
       { label: "API & integrations", path: "/vi/developers" },
+      { label: "Audit & access", path: "/vi/audit" },
     ].find((n) => n.path === location.pathname)?.label || "Overview";
   if(authRequired)return <AccessGate onAuthenticated={()=>setAuthRequired(false)}/>;
   return (
@@ -209,6 +234,7 @@ export default function App() {
             API & integrations
             <ArrowUpRight size={13} className="nav-end" />
           </NavLink>
+          {identity?.audit&&<NavLink to="/vi/audit" className="nav-item"><ShieldCheck size={17}/>Audit & access</NavLink>}
           <a
             className="nav-item"
             href="https://nvd.nist.gov/vuln"
@@ -221,10 +247,11 @@ export default function App() {
           <div className="user">
             <div className="avatar">AN</div>
             <span>
-              Analyst workspace<small>Local session</small>
+              {identity?.id.startsWith("oidc:")?`SSO ${identity.id.slice(5,17)}`:"Operator workspace"}<small>{identity?.role||"Checking access"}</small>
             </span>
-            <button className="icon-button" aria-label="Sign out" onClick={async()=>{await fetch("/api/session",{method:"DELETE"});setAuthRequired(true)}}><LogOut size={14}/></button>
+            <button className="icon-button" aria-label="Sign out" onClick={async()=>{setLogoutError("");try{await logoutSession();setAuthRequired(true)}catch(e){setLogoutError((e as Error).message)}}}><LogOut size={14}/></button>
           </div>
+          {logoutError&&<p role="alert" className="form-error">{logoutError}</p>}
         </div>
       </aside>
       <div className="main-shell" inert={!!selected || mobileOpen}>
@@ -246,6 +273,9 @@ export default function App() {
             <strong>{current}</strong>
           </div>
           <div className="topbar-actions">
+            <button ref={tourTrigger} className="tour-launch" aria-label="User tour" disabled={!identity} onClick={startTour}>
+              <Compass size={17} aria-hidden="true" /><span>User tour</span>
+            </button>
             <ThemeToggle />
             <form
               className="global-search"
@@ -309,6 +339,7 @@ export default function App() {
           )}
         </header>
         <main id="main">
+          {identity && tourWelcome && <TourWelcome onStart={startTour} onDismiss={dismissTourWelcome} />}
           <Routes>
             <Route path="/" element={<Overview onSelect={setSelected} />} />
             <Route path="/vi" element={<Overview onSelect={setSelected} />} />
@@ -335,6 +366,7 @@ export default function App() {
             />
             <Route path="/vi/sources" element={<Sources />} />
             <Route path="/vi/developers" element={<Developer />} />
+            <Route path="/vi/audit" element={<AuditManagement />} />
             <Route
               path="*"
               element={
@@ -366,6 +398,7 @@ export default function App() {
           onClose={() => setSelected(null)}
         />
       )}
+      {tourActive && <UserTour onClose={() => { setTourActive(false); tourTrigger.current?.focus(); }} />}
     </div>
   );
 }

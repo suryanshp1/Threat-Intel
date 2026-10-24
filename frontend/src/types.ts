@@ -5,6 +5,10 @@ export interface Vulnerability {
   patch_status: string;
   remediation?: string;
   provenance: {source:string;url:string;retrieved_at:string;sha256:string}[];
+  source_assertions?: SourceAssertion[];
+  poc_references?: PocReference[];
+  remediation_evidence?: RemediationEvidence[];
+  cisa_date_added?: string | null;
   
   title: string;
   description: string;
@@ -31,6 +35,41 @@ export interface Vulnerability {
   sources: string[];
   score_breakdown: Record<string, number | string>;
 }
+export interface EvidenceOrigin {
+  source: string;
+  url: string;
+  retrieved_at: string;
+  sha256: string;
+}
+export interface SourceAssertion {
+  source: string;
+  status: string;
+  metadata: { datePublished?: string; dateUpdated?: string; assignerShortName?: string };
+  cna: { title?: string; descriptions?: {lang: string; value: string}[]; metrics?: Record<string, unknown>[] };
+  provenance: EvidenceOrigin;
+}
+export interface PocReference {
+  source: string;
+  url: string;
+  verification: string;
+  provenance: EvidenceOrigin;
+}
+export interface RemediationEvidence {
+  source: string;
+  product?: string;
+  distribution?: string;
+  release?: string;
+  branch?: string;
+  status?: string;
+  fixed_version_raw?: string;
+  fixed_versions?: string[];
+  release_status?: string;
+  mapping_scope?: string;
+  notice_id?: string;
+  published_at?: string;
+  advisory_url?: string;
+  provenance: EvidenceOrigin;
+}
 export interface Actor {
   id: string;
   country: string;
@@ -54,6 +93,7 @@ export interface Source {
   records?:number;
   last_error?:string;
   configuration_required?:string;
+  coverage?:string;
 }
 export interface Stats {
   total: number;

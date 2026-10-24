@@ -1,4 +1,7 @@
 pub mod adapters;
+pub mod expansion;
+pub mod knowledge;
+pub mod scrapers;
 use chrono::{Duration, Utc};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -33,7 +36,7 @@ impl Fetcher {
                 .user_agent("Sentinel-Intelligence/0.2 (open-source vulnerability intelligence)")
                 .connect_timeout(Timeout::from_secs(15))
                 .timeout(Timeout::from_secs(180))
-                .redirect(reqwest::redirect::Policy::limited(4))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| e.to_string())?,
             cache: std::env::var("VI_FEED_CACHE")
@@ -42,6 +45,14 @@ impl Fetcher {
         })
     }
     pub async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<Document, String> {
+        self.get_bounded(url, headers, 128 * 1024 * 1024).await
+    }
+    pub(crate) async fn get_bounded(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        max: usize,
+    ) -> Result<Document, String> {
         if !url.starts_with("https://") {
             return Err("Feeds require HTTPS".into());
         }
@@ -73,6 +84,14 @@ impl Fetcher {
             .map_err(|e| format!("Upstream transport failed: {e}"))?;
         let now = Utc::now().to_rfc3339();
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if tokio::fs::metadata(&path)
+                .await
+                .map_err(|e| e.to_string())?
+                .len()
+                > max as u64
+            {
+                return Err("Cached upstream document exceeds download limit".into());
+            }
             let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
             let sha256 = format!("{:x}", Sha256::digest(&bytes));
             return Ok(Document {
@@ -95,11 +114,13 @@ impl Fetcher {
             ));
         }
         let metadata = json!({"etag":response.headers().get("etag").and_then(|v|v.to_str().ok()),"last_modified":response.headers().get("last-modified").and_then(|v|v.to_str().ok())});
-        let max = 128 * 1024 * 1024;
+        if response.content_length().is_some_and(|n| n > max as u64) {
+            return Err("Upstream document exceeds download limit".into());
+        }
         let mut bytes = vec![];
         while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
             if bytes.len() + chunk.len() > max {
-                return Err("Upstream document exceeds 128 MB limit".into());
+                return Err(format!("Upstream document exceeds {max} byte limit"));
             }
             bytes.extend_from_slice(&chunk)
         }
@@ -122,6 +143,9 @@ impl Fetcher {
         })
     }
     pub async fn post(&self, url: &str, payload: &Value) -> Result<Value, String> {
+        if !url.starts_with("https://") {
+            return Err("Upstream API requires HTTPS".into());
+        }
         let mut response = self
             .client
             .post(url)
@@ -134,8 +158,8 @@ impl Fetcher {
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-            if bytes.len() + chunk.len() > 16 * 1024 * 1024 {
-                return Err("Upstream API response too large".into());
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err("Upstream API response exceeds 1 MiB".into());
             }
             bytes.extend_from_slice(&chunk)
         }
@@ -232,8 +256,20 @@ pub async fn commit(
     db.apply(source, batch, cp.clone()).await
 }
 pub async fn osv_analyze(purls: &[String]) -> Result<Vec<Value>, String> {
+    if purls.len() > 1000 || purls.iter().any(|p| p.len() > 2048) {
+        return Err("OSV package query exceeds input budget".into());
+    }
+    tokio::time::timeout(Timeout::from_secs(45), osv_analyze_bounded(purls))
+        .await
+        .map_err(|_| "OSV analysis exceeded 45 second budget".to_string())?
+}
+async fn osv_analyze_bounded(purls: &[String]) -> Result<Vec<Value>, String> {
     let f = Fetcher::new()?;
-    let mut findings = vec![];
+    let mut findings = Vec::new();
+    let mut details = std::collections::HashMap::<String, (Value, Value)>::new();
+    let mut total_bytes = 0usize;
+    let mut output_bytes = 0usize;
+    let mut total_pages = 0;
     for chunk in purls.chunks(100) {
         let queries: Vec<_> = chunk
             .iter()
@@ -251,30 +287,86 @@ pub async fn osv_analyze(purls: &[String]) -> Result<Vec<Value>, String> {
         }
         for (purl, group) in chunk.iter().zip(results) {
             let mut page = group.clone();
+            let mut tokens = std::collections::HashSet::new();
+            let mut ids = std::collections::HashSet::new();
             loop {
                 for v in page["vulns"].as_array().unwrap_or(&vec![]) {
-                    if let Some(id) = v["id"].as_str() {
-                        if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                            continue;
-                        }
+                    let Some(id) = v["id"].as_str() else { continue };
+                    if id.is_empty()
+                        || id.len() > 128
+                        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    {
+                        return Err("Invalid OSV advisory identifier".into());
+                    }
+                    if !ids.insert(id.to_string()) {
+                        continue;
+                    }
+                    if findings.len() >= 500 {
+                        return Err("OSV analysis exceeds 500 findings; split the manifest".into());
+                    }
+                    if !details.contains_key(id) {
                         let doc = f
-                            .get(&format!("https://api.osv.dev/v1/vulns/{id}"), &[])
+                            .get_bounded(
+                                &format!("https://api.osv.dev/v1/vulns/{id}"),
+                                &[],
+                                1024 * 1024,
+                            )
                             .await?;
-                        findings.push(json!({"purl":purl,"advisory":doc.json()?,"provenance":doc.provenance("OSV")}));
+                        total_bytes += doc.bytes.len();
+                        if total_bytes > 8 * 1024 * 1024 {
+                            return Err("OSV details exceed 8 MiB; split the manifest".into());
+                        }
+                        details.insert(id.to_string(), (doc.json()?, doc.provenance("OSV")));
+                    }
+                    let (advisory, provenance) = details.get(id).unwrap();
+                    findings.push(json!({"purl":purl,"advisory":advisory,"provenance":provenance}));
+                    output_bytes += serde_json::to_vec(findings.last().unwrap())
+                        .map_err(|e| e.to_string())?
+                        .len();
+                    if output_bytes > 8 * 1024 * 1024 {
+                        return Err("OSV output exceeds analysis byte budget".into());
                     }
                 }
-                let Some(token) = page["next_page_token"].as_str() else {
+                let Some(token) = page["next_page_token"].as_str().filter(|t| !t.is_empty()) else {
                     break;
                 };
+                check_page_token(&mut tokens, token, &mut total_pages)?;
                 let response = f
                     .post(
                         "https://api.osv.dev/v1/querybatch",
                         &json!({"queries":[{"package":{"purl":purl},"page_token":token}]}),
                     )
                     .await?;
+                if response["results"].as_array().is_none_or(|a| a.len() != 1) {
+                    return Err("OSV pagination response mismatch".into());
+                }
                 page = response["results"][0].clone();
             }
         }
     }
     Ok(findings)
+}
+fn check_page_token(
+    seen: &mut std::collections::HashSet<String>,
+    token: &str,
+    total: &mut usize,
+) -> Result<(), String> {
+    if token.len() > 4096 || seen.len() >= 5 || *total >= 50 || !seen.insert(token.to_string()) {
+        return Err("OSV pagination exceeded its budget or repeated a token".into());
+    }
+    *total += 1;
+    Ok(())
+}
+#[cfg(test)]
+mod analysis_budget_tests {
+    use super::*;
+    #[test]
+    fn repeated_tokens_and_page_count_fail_closed() {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0;
+        assert!(check_page_token(&mut seen, "one", &mut total).is_ok());
+        assert!(check_page_token(&mut seen, "one", &mut total).is_err());
+        total = 50;
+        assert!(check_page_token(&mut seen, "two", &mut total).is_err());
+    }
 }

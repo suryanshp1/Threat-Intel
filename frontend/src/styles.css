@@ -3436,3 +3436,11 @@ main {
 :root[data-theme="light"] ::selection { color: #17202e; }
 .theme-toggle { flex-shrink: 0; min-width: 36px; min-height: 36px; }
 .access-theme-toggle { position: absolute; top: 20px; right: 20px; }
+
+.evidence-timeline, .evidence-records { list-style: none; padding: 0; margin: 16px 0 28px; }
+.evidence-timeline li, .evidence-records li { display: grid; gap: 5px; padding: 16px 0; border-bottom: 1px solid var(--color-line); min-width: 0; overflow-wrap: anywhere; }
+.evidence-timeline li { padding-left: 16px; border-left: 2px solid var(--color-line); }
+.evidence-timeline time { font-size: 12px; color: var(--color-muted); }
+.evidence-timeline code { display: block; font-size: 11px; overflow-wrap: anywhere; margin-top: 8px; }
+.evidence-panel details summary { cursor: pointer; font-size: 12px; }
+.evidence-panel .text-link { width: fit-content; max-width: 100%; }

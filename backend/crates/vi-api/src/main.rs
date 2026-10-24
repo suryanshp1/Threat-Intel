@@ -1,4 +1,7 @@
+mod credentials;
+mod management;
 mod mcp;
+mod oidc;
 mod security;
 mod telemetry;
 use async_graphql::{Context, EmptyMutation, EmptySubscription, Object, Schema};
@@ -8,7 +11,7 @@ use axum::{
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +29,9 @@ struct App {
     security: security::Security,
     buckets: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
     metrics: Arc<telemetry::Metrics>,
+    requests: Arc<tokio::sync::Semaphore>,
+    analyses: Arc<tokio::sync::Semaphore>,
+    exports: Arc<tokio::sync::Semaphore>,
 }
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 fn err(status: StatusCode, detail: impl ToString) -> (StatusCode, Json<Value>) {
@@ -42,6 +48,31 @@ fn database_error(error: String) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn validate_lookup(q: &Value) -> Result<(), (StatusCode, Json<Value>)> {
+    if ["name", "product", "ecosystem", "cve", "kb"]
+        .iter()
+        .any(|k| q.get(*k).is_some_and(|v| !v.is_null() && !v.is_string()))
+        || ["limit", "skip"].iter().any(|k| {
+            q.get(*k)
+                .is_some_and(|v| !v.is_null() && v.as_u64().is_none())
+        })
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Lookup field has an invalid type",
+        ));
+    }
+
+    if ["name", "product", "ecosystem", "cve", "kb"]
+        .iter()
+        .any(|k| q[*k].as_str().is_some_and(|s| s.len() > 512))
+        || q["limit"].as_u64().is_some_and(|v| v == 0 || v > 100)
+        || q["skip"].as_u64().is_some_and(|v| v > 10000)
+    {
+        return Err(err(StatusCode::BAD_REQUEST, "Lookup exceeds input limits"));
+    }
+    Ok(())
+}
 #[derive(Deserialize, Serialize, Default, utoipa::ToSchema)]
 struct Filter {
     #[serde(default)]
@@ -63,6 +94,8 @@ struct Condition {
 }
 #[utoipa::path(post,path="/api/v2/vulnerabilities/filter",request_body=Filter,responses((status=200,description="Filtered CVE records, facets, and next_cursor",body=Value),(status=400,description="Invalid filter")),tag="Vulnerabilities")]
 async fn filter(State(app): State<App>, Json(f): Json<Filter>) -> ApiResult {
+    vi_core::validate_query(&serde_json::to_value(&f).unwrap())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     let allowed = [
         "id",
         "vendor",
@@ -174,67 +207,24 @@ async fn stats(State(app): State<App>) -> ApiResult {
 }
 #[utoipa::path(post,path="/api/threat-actors",request_body=Value,responses((status=200,body=Value)),tag="Intelligence")]
 async fn actors(State(app): State<App>, Json(q): Json<Value>) -> ApiResult {
-    let mut rows = app.db.entities("actors").await.map_err(database_error)?;
-    rows.extend(
-        app.db
-            .entities("ransomware")
-            .await
-            .map_err(database_error)?,
-    );
-    let name = q["name"].as_str().unwrap_or("").to_lowercase();
-    rows.retain(|a| {
-        a["id"]
-            .as_str()
-            .unwrap_or("")
-            .to_lowercase()
-            .contains(&name)
-            && q["cve"].as_str().is_none_or(|c| {
-                a["cves_exploited"]
-                    .as_array()
-                    .is_some_and(|v| v.contains(&json!(c)))
-            })
-    });
-    let total = rows.len();
-    let skip = q["skip"].as_u64().unwrap_or(0) as usize;
-    let limit = q["limit"].as_u64().unwrap_or(500).clamp(1, 1000) as usize;
-    Ok(Json(
-        json!({"results":rows.into_iter().skip(skip).take(limit).collect::<Vec<_>>(),"total":total}),
-    ))
+    validate_lookup(&q)?;
+    app.db
+        .entity_page(&["actors", "ransomware"], &q)
+        .await
+        .map(Json)
+        .map_err(database_error)
 }
+
 #[utoipa::path(post,path="/api/affected-product",request_body=Value,responses((status=200,body=Value)),tag="Intelligence")]
 async fn products(State(app): State<App>, Json(q): Json<Value>) -> ApiResult {
-    let query = q["name"].as_str().unwrap_or("").to_lowercase();
-    let ecosystem = q["ecosystem"].as_str().unwrap_or("");
-    let mut rows = app.db.entities("products").await.map_err(database_error)?;
-    // NVD CPEs are authoritative. Never manufacture a CPE from a product name.
-    let result = app
-        .db
-        .query(&json!({"text_search":query,"limit":100}))
+    validate_lookup(&q)?;
+    app.db
+        .product_page(&q)
         .await
-        .map_err(database_error)?;
-    for v in result["results"].as_array().unwrap_or(&vec![]) {
-        if v["purl"].as_str().is_some_and(|p| !p.is_empty())
-            || v["cpe"].as_array().is_some_and(|p| !p.is_empty())
-        {
-            rows.push(json!({"name":v["product"],"vendor":v["vendor"],"ecosystem":v["ecosystem"],"purl":v["purl"],"cpe":v["cpe"].as_array().and_then(|a|a.first()).and_then(Value::as_str).unwrap_or(""),"affected_version_range":v["affected_version"],"fixed_version":v["fixed_version"],"cve_id":v["id"],"priority_score":v["priority_score"],"is_malicious_package":v["malicious"],"provenance":v["provenance"]}));
-        }
-    }
-    rows.retain(|v| {
-        (ecosystem.is_empty() || v["ecosystem"] == ecosystem)
-            && (query.is_empty()
-                || format!("{} {} {} {}", v["name"], v["vendor"], v["purl"], v["cpe"])
-                    .to_lowercase()
-                    .contains(&query))
-    });
-    let mut seen = HashSet::new();
-    rows.retain(|v| seen.insert(format!("{}:{}", v["cve_id"], v["purl"])));
-    let total = rows.len();
-    let skip = q["skip"].as_u64().unwrap_or(0) as usize;
-    let limit = q["limit"].as_u64().unwrap_or(100).clamp(1, 100) as usize;
-    Ok(Json(
-        json!({"results":rows.into_iter().skip(skip).take(limit).collect::<Vec<_>>(),"total":total}),
-    ))
+        .map(Json)
+        .map_err(database_error)
 }
+
 async fn cpe(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
     products(State(app), Json(json!({"name":q.get("keyword")}))).await
 }
@@ -245,15 +235,26 @@ async fn kb(State(app): State<App>, Json(q): Json<Value>) -> ApiResult {
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "kb is required"))?
         .trim()
         .to_uppercase();
-    let patches = app.db.entities("patches").await.map_err(database_error)?;
+    validate_lookup(&q)?;
     let product = q["product"].as_str();
     let mut queue = vec![id.clone()];
     let mut seen = HashSet::new();
     let mut rows = vec![];
     while let Some(current) = queue.pop() {
-        if !seen.insert(current.clone()) || seen.len() > 1000 {
+        if seen.len() >= 100 {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "Patch graph exceeds 100 nodes",
+            ));
+        }
+        if !seen.insert(current.clone()) {
             continue;
         }
+        let patches = app
+            .db
+            .patch_candidates(&current)
+            .await
+            .map_err(database_error)?;
         for p in patches
             .iter()
             .filter(|p| p["id"] == current && product.is_none_or(|v| p["product"] == v))
@@ -277,6 +278,12 @@ async fn kb(State(app): State<App>, Json(q): Json<Value>) -> ApiResult {
                     queue.push(id.into())
                 }
             }
+            if rows.len() >= 100 {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "Patch graph exceeds 100 results",
+                ));
+            }
             rows.push(row);
         }
     }
@@ -296,15 +303,41 @@ async fn zerodays(State(app): State<App>) -> ApiResult {
     app.db.query(&json!({"conditions":[{"field":"is_zeroday","operator":"eq","value":true}],"sort_by":"published","limit":100})).await.map(Json).map_err(database_error)
 }
 #[utoipa::path(get,path="/api/v2/vex",responses((status=200,body=Value)),tag="Tools")]
-async fn list_vex(State(app): State<App>) -> ApiResult {
+async fn list_vex(State(app): State<App>, Query(q): Query<HashMap<String, String>>) -> ApiResult {
+    let limit = q
+        .get("limit")
+        .map(|s| s.parse::<usize>())
+        .transpose()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid VEX page limit"))?
+        .unwrap_or(100);
+    let skip = q
+        .get("skip")
+        .map(|s| s.parse::<usize>())
+        .transpose()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "Invalid VEX page offset"))?
+        .unwrap_or(0);
+    if limit == 0 || limit > 100 || skip > 10000 {
+        return Err(err(StatusCode::BAD_REQUEST, "VEX page exceeds limits"));
+    }
     app.db
-        .vex()
+        .vex_page(limit, skip)
         .await
-        .map(|v| Json(json!({"results":v})))
+        .map(Json)
         .map_err(database_error)
 }
+
 #[utoipa::path(post,path="/api/v2/vex",request_body=Value,responses((status=200,body=Value),(status=400,description="Invalid OpenVEX")),tag="Tools")]
-async fn save_vex(State(app): State<App>, Json(doc): Json<Value>) -> ApiResult {
+async fn save_vex(
+    State(app): State<App>,
+    Extension(principal): Extension<credentials::Principal>,
+    Json(doc): Json<Value>,
+) -> ApiResult {
+    if doc.to_string().len() > 128 * 1024 {
+        return Err(err(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "VEX document exceeds 128 KiB",
+        ));
+    }
     if doc["@context"] != "https://openvex.dev/ns/v0.2.0" {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -323,6 +356,9 @@ async fn save_vex(State(app): State<App>, Json(doc): Json<Value>) -> ApiResult {
                 "At least one statement is required",
             )
         })?;
+    if statements.len() > 100 {
+        return Err(err(StatusCode::BAD_REQUEST, "VEX exceeds 100 statements"));
+    }
     for stmt in statements {
         let status = stmt["status"].as_str().unwrap_or("");
         if !["affected", "not_affected", "fixed", "under_investigation"].contains(&status) {
@@ -342,6 +378,7 @@ async fn save_vex(State(app): State<App>, Json(doc): Json<Value>) -> ApiResult {
             .is_empty()
             || !stmt["products"].as_array().is_some_and(|p| {
                 !p.is_empty()
+                    && p.len() <= 100
                     && p.iter().all(|p| {
                         p["@id"].as_str().is_some_and(|id| {
                             id.starts_with("pkg:") && vi_core::package_version(id).is_some()
@@ -359,7 +396,7 @@ async fn save_vex(State(app): State<App>, Json(doc): Json<Value>) -> ApiResult {
         return Err(err(StatusCode::BAD_REQUEST, "Document @id is required"));
     }
     app.db
-        .save_vex(doc.clone(), "authenticated-analyst")
+        .save_vex(doc.clone(), &principal.id)
         .await
         .map_err(database_error)?;
     Ok(Json(doc))
@@ -430,7 +467,11 @@ async fn analyze(State(app): State<App>, Json(payload): Json<Value>) -> ApiResul
             "OSV could not complete the applicability query; no clean result is inferred",
         )
     })?;
-    let docs = app.db.vex().await.map_err(database_error)?;
+    let docs = app
+        .db
+        .vex_for_purls(&versioned)
+        .await
+        .map_err(database_error)?;
     let mut findings = vec![];
     for item in upstream {
         let advisory = &item["advisory"];
@@ -482,22 +523,36 @@ async fn analyze(State(app): State<App>, Json(payload): Json<Value>) -> ApiResul
 }
 #[utoipa::path(get,path="/api/v2/vulnerabilities/{id}/rules",params(("id"=String,Path,description="CVE identifier")),responses((status=200,body=Value),(status=404,description="Unknown CVE")),tag="Vulnerabilities")]
 async fn rules(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
-    let mut rows = app.db.entities("rules").await.map_err(database_error)?;
-    rows.retain(|r| r["cve_id"] == id);
-    Ok(Json(
-        json!({"results":rows,"note":"Source-backed detection artifacts. Review the upstream license and test rules before deployment."}),
-    ))
-}
-async fn relations(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
-    let rows = app
+    let mut result = app
         .db
-        .entities("relationships")
+        .entity_links("rules", &id)
         .await
         .map_err(database_error)?;
-    Ok(Json(
-        json!({"results":rows.into_iter().filter(|r|r["source_ref"]==id||r["target_ref"]==id||r["cve_id"]==id).collect::<Vec<_>>()}),
-    ))
+    result["note"] =
+        json!("Source-backed detection artifacts. Review upstream licenses before deployment.");
+    Ok(Json(result))
 }
+
+#[utoipa::path(get,path="/api/knowledge/{id}",params(("id"=String,Path,description="CWE-79 or OWASP-A01:2025")),responses((status=200,body=Value),(status=404,description="Knowledge entry not found")),tag="Intelligence")]
+async fn knowledge(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    app.db
+        .knowledge(&id.to_uppercase())
+        .await
+        .map_err(database_error)?
+        .map(Json)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Knowledge entry not found"))
+}
+async fn relations(State(app): State<App>, Path(id): Path<String>) -> ApiResult {
+    let knowledge = app.db.knowledge(&id).await.map_err(database_error)?;
+    let mut result = app
+        .db
+        .entity_links("relationships", &id)
+        .await
+        .map_err(database_error)?;
+    result["knowledge"] = knowledge.unwrap_or(Value::Null);
+    Ok(Json(result))
+}
+
 #[utoipa::path(get,path="/api/download/latest",responses((status=200,description="Cursor-paginated NDJSON export",body=String)),tag="Intelligence")]
 async fn download(State(app): State<App>) -> Response {
     let db = app.db.clone();
@@ -587,12 +642,16 @@ async fn sources(State(app): State<App>) -> ApiResult {
         .map(|v| Json(json!({"results":v})))
         .map_err(database_error)
 }
-async fn ingest(State(app): State<App>, Json(q): Json<Value>) -> ApiResult {
+async fn ingest(
+    State(app): State<App>,
+    Extension(principal): Extension<credentials::Principal>,
+    Json(q): Json<Value>,
+) -> ApiResult {
     let source = q["source"]
         .as_str()
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "source is required"))?;
     app.db
-        .enqueue(source)
+        .enqueue(source, &principal.id)
         .await
         .map(Json)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))
@@ -616,20 +675,45 @@ async fn readiness(State(app): State<App>) -> Response {
     info(
         title = "Sentinel Intelligence API",
         version = "0.1.0",
-        description = "Source-backed vulnerability intelligence API. Production deployments require bearer authentication or an HttpOnly operator session."
+        description = "Source-backed vulnerability intelligence API. Production deployments require bearer authentication or an authenticated operator/OIDC HttpOnly session."
     ),
     paths(
-        filter, detail, stats, actors, products, kb, list_vex, save_vex, analyze, rules, download
+        filter,
+        detail,
+        knowledge,
+        stats,
+        actors,
+        products,
+        kb,
+        list_vex,
+        save_vex,
+        analyze,
+        rules,
+        download,
+        management::me,
+        management::events,
+        management::revisions,
+        management::users,
+        management::update_user,
+        management::sessions,
+        management::revoke
     ),
-    components(schemas(Vulnerability, Filter, Condition))
+    components(schemas(Vulnerability, Filter, Condition, management::Access))
 )]
 struct ApiDoc;
 async fn openapi() -> Json<Value> {
     Json(serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serialization"))
 }
 async fn docs() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html><html><head><title>Sentinel API</title></head><body><script id="api-reference" data-url="/api-docs/openapi.json"></script><script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script></body></html>"#,
+    Html(include_str!("docs.html"))
+}
+async fn docs_script() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("docs.js"),
     )
 }
 #[tokio::main]
@@ -644,15 +728,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         security,
         buckets: Default::default(),
         metrics: metrics_collector.clone(),
+        requests: Arc::new(tokio::sync::Semaphore::new(16)),
+        analyses: Arc::new(tokio::sync::Semaphore::new(2)),
+        exports: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let api = Router::new()
         .route(
             "/mcp",
             post(mcp::handle).layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024)),
         )
+        .route("/auth/me", get(management::me))
+        .route("/audit/events", get(management::events))
+        .route("/audit/vex-revisions", get(management::revisions))
+        .route("/admin/users", get(management::users))
+        .route(
+            "/admin/users/{id}",
+            axum::routing::put(management::update_user),
+        )
+        .route("/admin/users/{id}/sessions", get(management::sessions))
+        .route(
+            "/admin/sessions/{id}",
+            axum::routing::delete(management::revoke),
+        )
         .route("/stats/", get(stats))
         .route("/vulnerabilities", post(filter))
         .route("/vulnerabilities/{id}", get(detail))
+        .route("/knowledge/{id}", get(knowledge))
         .route("/v2/vulnerabilities/filter", post(filter))
         .route("/v2/vulnerabilities/{id}/rules", get(rules))
         .route("/latest/zerodays", get(zerodays))
@@ -675,8 +776,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = Router::new()
         .route(
             "/api/session",
-            post(security::login).delete(security::logout),
+            post(security::login)
+                .delete(security::logout)
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(4096)),
         )
+        .route("/api/auth/config", get(oidc::info))
+        .route("/api/auth/oidc/start", post(oidc::start))
+        .route("/api/auth/oidc/callback", get(oidc::callback))
         .route("/readyz", get(readiness))
         .nest("/api", api)
         .route(
@@ -685,6 +791,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api-docs/openapi.json", get(openapi))
         .route("/scalar", get(docs))
+        .route("/api-docs/ui.js", get(docs_script))
         .route(
             "/taxii2/",
             get(|| async {
@@ -695,6 +802,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             metrics_collector.clone(),
             telemetry::track_telemetry,
         ))
+        .layer(middleware::from_fn_with_state(
+            app.clone(),
+            security::budget,
+        ))
+        .layer(middleware::from_fn(security::private_cache))
         .with_state(app)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             10 * 1024 * 1024,

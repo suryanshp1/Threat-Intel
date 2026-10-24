@@ -13,3 +13,7 @@ fs2 = "0.4"
 base64 = "0.22"
 chrono.workspace = true
 uuid = {version="1",features=["v4"]}
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-postgres-rustls = { version = "0.13", default-features = false }
+rustls-native-certs = "0.8"
+rustls-pki-types = { version = "1", features = ["std"] }
