@@ -10,7 +10,7 @@ tokio.workspace = true
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 deadpool-postgres = "0.14"
 fs2 = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 chrono.workspace = true
 uuid = {version="1",features=["v4"]}
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

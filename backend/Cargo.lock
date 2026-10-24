@@ -3806,7 +3806,7 @@ version = "0.1.0"
 dependencies = [
  "async-graphql",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "futures-util",
  "jsonwebtoken",
@@ -3842,7 +3842,7 @@ dependencies = [
 name = "vi-db"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "deadpool-postgres",
  "fs2",
