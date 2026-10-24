@@ -17,7 +17,7 @@ tower-http = { version = "0.6", features = ["fs", "trace", "limit"] }
 async-graphql = "7"
 utoipa = "5"
 vi-ingest.workspace = true
-redis = { version = "0.27", features = ["tokio-comp"] }
+redis = { version = "1.7", features = ["tokio-comp"] }
 sha2 = "0.10"
 subtle = "2"
 futures-util = "0.3"
