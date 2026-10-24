@@ -118,11 +118,10 @@ pub fn parse_nvd(doc: &Document) -> Result<Batch, String> {
             .cloned()
             .unwrap_or_default()
             .into();
-        fields["patch_available"] = json!(v["references"].as_array().is_some_and(|a| a
-            .iter()
-            .any(|r| r["tags"]
-                .as_array()
-                .is_some_and(|t| t.contains(&json!("Patch"))))));
+        crate::knowledge::nvd_evidence(doc, v, id, &mut fields, &mut batch);
+        fields["patch_available"] = json!(fields["patch_links"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()));
         if fields["patch_available"] == true {
             fields["patch_status"] = json!("available");
         }
@@ -147,6 +146,13 @@ pub async fn ingest(
             commit(db, source, b, cp).await
         }
         "NVD 2.0" => nvd(db, f, cp).await,
+        "CVE List V5" | "Debian Security Tracker" | "Ubuntu USN" | "Trickest PoC references" => {
+            crate::expansion::ingest(db, f, source, cp).await
+        }
+        "Apache HTTP Server" | "Apache Tomcat" | "OpenSSL" | "curl" => {
+            crate::scrapers::ingest(db, f, source, cp).await
+        }
+        "MITRE CWE" | "OWASP Top 10" => crate::knowledge::ingest(db, f, source, cp).await,
         "FIRST EPSS" => epss(db, f, cp).await,
         "MITRE ATT&CK" => attack(db, f, cp).await,
         "RansomLook" => ransomlook(db, f, cp).await,
@@ -674,6 +680,21 @@ async fn parse_rule_archive(
     cp["scanned_files"] = json!(scanned);
     Ok(total)
 }
+fn detection_yaml(raw: &str) -> Result<Value, String> {
+    let mut budget = serde_saphyr::Budget::default();
+    budget.max_depth = 32;
+    budget.max_nodes = 25000;
+    budget.max_events = 50000;
+    budget.max_documents = 1;
+    budget.max_aliases = 100;
+    budget.max_anchors = 1000;
+    budget.max_total_scalar_bytes = 1024 * 1024;
+    budget.max_recorded_anchor_bytes = 1024 * 1024;
+    let mut options = serde_saphyr::Options::default();
+    options.budget = Some(budget);
+    serde_saphyr::from_str_with_options(raw, options)
+        .map_err(|_| "Detection YAML rejected by parser budget".into())
+}
 fn extract_rules(doc: &Document, source: &str) -> Result<(Batch, usize), String> {
     use std::io::Read;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(doc.bytes.as_slice()));
@@ -720,7 +741,7 @@ fn extract_rules(doc: &Document, source: &str) -> Result<(Batch, usize), String>
                 }
             }
         } else {
-            let yaml: Value = match serde_yaml::from_str::<Value>(&raw) {
+            let yaml: Value = match detection_yaml(&raw) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -799,6 +820,13 @@ mod tests {
             sha256: "test-only".into(),
             fetched_at: "2026-01-01T00:00:00Z".into(),
         }
+    }
+    #[test]
+    fn detection_yaml_parses_data_and_rejects_deep_expansion() {
+        let row=detection_yaml("id: fixture\ntitle: Fixture rule\nreferences:\n  - https://example.test/CVE-2099-1000\n").unwrap();
+        assert_eq!(row["title"], "Fixture rule");
+        assert!(detection_yaml(&format!("{}0{}", "[".repeat(40), "]".repeat(40))).is_err());
+        assert!(detection_yaml("---\none: 1\n---\ntwo: 2").is_err());
     }
     #[test]
     fn kev_does_not_invent_cvss_publication_or_actor() {

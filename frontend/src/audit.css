@@ -1,0 +1,114 @@
+.audit-panel {
+  padding: 24px;
+  min-width: 0;
+}
+.audit-panel h2 {
+  margin: 0 0 12px;
+}
+.audit-panel p {
+  color: var(--theme-text-secondary, #999);
+  line-height: 1.6;
+}
+.audit-filters {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 24px 0;
+}
+.audit-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 160px;
+  flex: 1;
+}
+.audit-filters input:not([type="checkbox"]),
+.audit-filters select {
+  padding: 10px;
+  border: 1px solid var(--theme-border, #303030);
+  border-radius: 6px;
+  background: var(--theme-surface, #191919);
+  color: inherit;
+  width: 100%;
+}
+.audit-filters .audit-checkbox {
+  flex-direction: row;
+  align-items: center;
+  min-height: 40px;
+}
+.audit-table {
+  overflow: auto;
+}
+.audit-table table {
+  border-collapse: collapse;
+  width: 100%;
+  text-align: left;
+}
+.audit-table th,
+.audit-table td {
+  padding: 14px;
+  border-bottom: 1px solid var(--theme-border, #303030);
+  vertical-align: top;
+}
+.audit-table td code,
+.audit-identity {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.audit-panel pre {
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.audit-panel summary {
+  cursor: pointer;
+  padding: 8px 0;
+}
+.audit-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 24px;
+}
+.audit-revision,
+.audit-user {
+  border-top: 1px solid var(--theme-border, #303030);
+  padding: 20px 0;
+}
+.audit-diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+.audit-diff > div {
+  min-width: 0;
+}
+.audit-session {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+}
+@media (max-width: 760px) {
+  .audit-panel {
+    padding: 16px;
+  }
+  .audit-diff {
+    grid-template-columns: 1fr;
+  }
+  .audit-session {
+    align-items: start;
+    flex-direction: column;
+  }
+  .audit-filters label {
+    min-width: 100%;
+  }
+}
+.audit-user h3,
+.audit-user p {
+  overflow-wrap: anywhere;
+}

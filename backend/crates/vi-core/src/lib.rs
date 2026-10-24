@@ -38,6 +38,12 @@ pub struct Vulnerability {
     pub epss_known: bool,
     pub cpe: Vec<String>,
     pub references: Vec<Value>,
+    pub weaknesses: Vec<String>,
+    pub weakness_evidence: Vec<Value>,
+    pub patch_links: Vec<Value>,
+    pub remediation_evidence: Vec<Value>,
+    pub source_assertions: Vec<Value>,
+    pub poc_references: Vec<Value>,
     pub provenance: Vec<Value>,
     pub affected: Vec<Value>,
     pub cisa_date_added: Option<String>,
@@ -102,6 +108,12 @@ pub struct Store {
     pub products: Vec<Value>,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default)]
+    pub revoked_sessions: Vec<Value>,
+    #[serde(default)]
+    pub weaknesses: Vec<Value>,
+    #[serde(default)]
+    pub categories: Vec<Value>,
 }
 pub const JUSTIFICATIONS: [&str; 5] = [
     "component_not_present",
@@ -223,12 +235,22 @@ mod tests {
 pub const SOURCES: &[(&str, u64)] = &[
     ("CISA KEV", 86400),
     ("NVD 2.0", 7200),
+    ("CVE List V5", 300),
+    ("Debian Security Tracker", 86400),
+    ("Ubuntu USN", 3600),
+    ("Trickest PoC references", 600),
     ("FIRST EPSS", 86400),
     ("CISA Vulnrichment", 3600),
     ("OSV / GHSA", 3600),
     ("MITRE ATT&CK", 604800),
+    ("MITRE CWE", 604800),
+    ("OWASP Top 10", 604800),
     ("RansomLook", 3600),
     ("Microsoft MSRC", 86400),
+    ("Apache HTTP Server", 86400),
+    ("Apache Tomcat", 86400),
+    ("OpenSSL", 86400),
+    ("curl", 86400),
     ("Nuclei", 21600),
     ("Sigma", 86400),
     ("Suricata", 86400),
@@ -247,6 +269,30 @@ pub fn merge_record(
         .unwrap_or_else(|| json!({}));
     let object = value.as_object_mut().unwrap();
     for (key, item) in patch.as_object().ok_or("Record patch must be an object")? {
+        // CNA assertions remain independently inspectable. A supplemental publisher
+        // record fills missing display fields without replacing other sources.
+        if patch["sources"] == json!(["CVE List V5"])
+            && [
+                "title",
+                "description",
+                "published",
+                "vendor",
+                "product",
+                "cvss",
+                "cvss_known",
+                "cvss_vector",
+            ]
+            .contains(&key.as_str())
+            && existing.is_some_and(|v| match key.as_str() {
+                "cvss" | "cvss_known" | "cvss_vector" => v.cvss_known,
+                _ => object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty()),
+            })
+        {
+            continue;
+        }
         if (key == "patch_status"
             && item == "unknown"
             && object.get(key).is_some_and(|v| v == "available"))
@@ -258,6 +304,12 @@ pub fn merge_record(
             "sources",
             "provenance",
             "references",
+            "weaknesses",
+            "weakness_evidence",
+            "patch_links",
+            "remediation_evidence",
+            "source_assertions",
+            "poc_references",
             "aliases",
             "cpe",
             "actors",
@@ -269,6 +321,16 @@ pub fn merge_record(
             if let Some(items) = item.as_array() {
                 let dst = array.as_array_mut().ok_or("Invalid array field")?;
                 for v in items {
+                    if [
+                        "source_assertions",
+                        "poc_references",
+                        "remediation_evidence",
+                    ]
+                    .contains(&key.as_str())
+                        && dst.iter().any(|old| same_assertion(old, v))
+                    {
+                        continue;
+                    }
                     if !dst.contains(v) {
                         dst.push(v.clone())
                     }
@@ -289,6 +351,22 @@ pub fn merge_record(
     }
     record.score();
     Ok(record)
+}
+
+// Page hashes and retrieval times change even when a specific advisory assertion
+// does not. Keep its first observation, and retain all fetched documents separately
+// in the record-level provenance. Changed content still creates a history entry.
+fn same_assertion(a: &Value, b: &Value) -> bool {
+    match (a.as_object(), b.as_object()) {
+        (Some(a), Some(b)) => {
+            a.keys().filter(|k| k.as_str() != "provenance").count()
+                == b.keys().filter(|k| k.as_str() != "provenance").count()
+                && a.iter()
+                    .filter(|(k, _)| k.as_str() != "provenance")
+                    .all(|(k, value)| b.get(k) == Some(value))
+        }
+        _ => a == b,
+    }
 }
 
 pub fn valid_cve(id: &str) -> bool {
@@ -312,7 +390,7 @@ mod production_tests {
                 && s.ransomware.is_empty()
                 && s.patches.is_empty()
         );
-        assert_eq!(s.checkpoints.len(), 12);
+        assert_eq!(s.checkpoints.len(), SOURCES.len());
     }
     #[test]
     fn enrichment_merges_sources_without_erasing_evidence() {
@@ -331,5 +409,39 @@ mod production_tests {
     fn invalid_probability_is_rejected() {
         assert!(merge_record(None, &json!({"id":"CVE-2099-1000","epss_score":2.0})).is_err());
         assert!(merge_record(None, &json!({"id":"CVE-invalid"})).is_err());
+    }
+}
+
+/// Shared request-cost bounds for REST, GraphQL, MCP and direct database callers.
+pub fn validate_query(value: &Value) -> Result<(), String> {
+    if value["text_search"].as_str().is_some_and(|s| s.len() > 512)
+        || value["cursor"].as_str().is_some_and(|s| s.len() > 4096)
+        || value["conditions"].as_array().is_some_and(|a| a.len() > 30)
+        || value["limit"].as_u64().is_some_and(|n| n == 0 || n > 100)
+    {
+        return Err("Query exceeds input limits".into());
+    }
+    for condition in value["conditions"].as_array().unwrap_or(&vec![]) {
+        let item = &condition["value"];
+        if item.as_str().is_some_and(|s| s.len() > 512)
+            || item.as_array().is_some_and(|a| {
+                a.len() > 100 || a.iter().any(|v| v.as_str().is_some_and(|s| s.len() > 512))
+            })
+        {
+            return Err("Query exceeds input limits".into());
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn query_budgets_cover_arrays_and_text() {
+        assert!(validate_query(&json!({"conditions":vec![json!({"value":0});31]})).is_err());
+        assert!(validate_query(&json!({"conditions":[{"value":vec!["x";101]}]})).is_err());
+        assert!(validate_query(&json!({"text_search":"x".repeat(513)})).is_err());
+        assert!(validate_query(&json!({"limit":101})).is_err());
+        assert!(validate_query(&json!({"limit":100,"text_search":"x".repeat(512)})).is_ok());
     }
 }

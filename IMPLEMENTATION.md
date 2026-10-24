@@ -20,8 +20,8 @@ The app now uses actual upstream intelligence and normalized PostgreSQL persiste
 | Sources | Twelve connector slots, eleven automatic public feed/repository adapters; explicit configuration requirement for vendor imports; retries, cache, bounds, checkpoints | ENISA/VulnCheck/deps.dev integrations, full historical backfill |
 | Detection | Real Nuclei, Sigma, Suricata CVE mappings, upstream rule links | YARA and rule execution/validation engines |
 | API | REST, GraphQL query, generated OpenAPI, Scalar, NDJSON stream, paginated STIX objects, nine read-only MCP tools with HTTP and stdio bridge | Full TAXII 2.1 conformance, generated client, scoped MCP credentials and OAuth |
-| Security | Operator bearer/session auth, HttpOnly/Strict/Secure production cookies, origin checks, Valkey sessions/quotas, audit events, request caps, restricted DB role | SSO/RBAC/multiple users, formal security assessment |
-| Deployment | Non-root containers, read-only app filesystems, PostgreSQL/Valkey volumes, Caddy TLS overlay, backup helper, CI | HA, automated restore drills and monitoring integration |
+| Security | OIDC SSO/local RBAC, recovery operator/scoped clients, durable sessions, audit/user/session UI, request budgets, restricted DB role | Tenant isolation, provider-wide logout/SCIM, immutable audit export, formal security assessment |
+| Deployment | Non-root containers, read-only app filesystems, PostgreSQL/Valkey volumes, Caddy TLS overlay, verified PostgreSQL TLS, backup helper, CI | HA, automated restore drills and monitoring integration |
 
 ## Verification
 

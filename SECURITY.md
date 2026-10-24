@@ -24,9 +24,9 @@ Maintainers can coordinate reproduction, mitigation, and disclosure through that
 
 ## Deployment trust boundaries
 
-Sentinel currently uses one operator credential. It does not provide SSO, per-user roles, or tenant isolation. A bearer token also authorizes REST operator actions, even if a client uses only the read-only MCP tools. Give it only to trusted clients.
+Sentinel supports optional OIDC SSO with locally assigned human-user roles, an operator recovery credential and expiring scoped client keys. New SSO users require administrator approval; provider groups and email addresses do not grant access. This is one shared workspace without tenant isolation. The operator bearer token authorizes all REST actions, even when configured in a read-only MCP client. Use a separate `read` client credential for integrations and grant analysis/write/ingestion scopes only when required. Client keys cannot be exchanged for operator browser sessions.
 
-Use the HTTPS deployment overlay for public access, keep PostgreSQL and Valkey private, protect `.env` and backups, and review [OPERATIONS.md](OPERATIONS.md) before operating an instance. Remote database connections require additional transport support as described there. Local development defaults are not a substitute for a deployment review.
+Use the HTTPS deployment overlay for public access, keep PostgreSQL and Valkey private, protect `.env` and backups, and review [OPERATIONS.md](OPERATIONS.md) before operating an instance. Use certificate/hostname-verified PostgreSQL TLS for remote database connections as described there. Local development defaults are not a substitute for a deployment review.
 
 Downloaded intelligence, advisory text, and detection references are untrusted content. They are not executable code or AI instructions. Unsigned local VEX does not suppress findings by default, and enabling local trust does not establish publisher identity or signatures.
 

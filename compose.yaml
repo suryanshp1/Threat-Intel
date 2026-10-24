@@ -32,13 +32,23 @@ services:
     init: true
     environment:
       DATABASE_URL: postgresql://sentinel_app:${VI_DB_PASSWORD:?Run npm run setup first}@postgres:5432/sentinel
+      VI_DB_TLS_MODE: disable
       REDIS_URL: redis://valkey:6379
       BIND_ADDR: 0.0.0.0
       VI_ENV: production
       VI_API_TOKEN: ${VI_API_TOKEN:?Set VI_API_TOKEN with at least 32 characters}
       VI_PUBLIC_ORIGIN: ${VI_PUBLIC_ORIGIN:-http://localhost:3000}
       VI_TRUST_LOCAL_VEX: "false"
+      VI_OIDC_ISSUER: ${VI_OIDC_ISSUER:-}
+      VI_OIDC_CLIENT_ID: ${VI_OIDC_CLIENT_ID:-}
+      VI_OIDC_CLIENT_SECRET: ${VI_OIDC_CLIENT_SECRET:-}
+      VI_CLIENT_TOKENS_FILE: /etc/sentinel/auth/clients.json
+      VI_TRUSTED_PROXIES: ${VI_TRUSTED_PROXIES:-}
       VI_FEED_CACHE: /tmp/vi-api-feed-cache
+    volumes: [./backend/data/auth:/etc/sentinel/auth:ro]
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 1G, pids: 256}
     depends_on:
       postgres: {condition: service_healthy}
       valkey: {condition: service_healthy}
@@ -55,12 +65,16 @@ services:
     init: true
     environment:
       DATABASE_URL: postgresql://sentinel_app:${VI_DB_PASSWORD:?Run npm run setup first}@postgres:5432/sentinel
+      VI_DB_TLS_MODE: disable
       VI_FEED_CACHE: /var/lib/vi/feed-cache
       VI_VEX_IMPORT_DIR: /var/lib/vi/vex-import
       NVD_API_KEY: ${NVD_API_KEY:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       VI_NVD_START: ${VI_NVD_START:-}
     volumes: [feed_data:/var/lib/vi]
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 2G, pids: 256}
     depends_on:
       postgres: {condition: service_healthy}
     read_only: true

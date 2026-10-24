@@ -29,6 +29,7 @@ import {
 import { api, download, downloadBlob, type Vulnerability } from "./types";
 import { sourceDescription, vulnerabilityExport, type ExportProgress } from "./ui-data";
 import { useTheme } from "./theme";
+import { EvidencePanel } from "./evidence-panel";
 
 export function ExportButton({ filter = {}, name, label = "Export", primary = false }: {
   filter?: Record<string, unknown>; name: string; label?: string; primary?: boolean;
@@ -453,7 +454,7 @@ export function DetailDrawer({
                 </div>
               </div>
               <nav className="tabs">
-                {["Overview", "Relationships", "Detection"].map((t) => (
+                {["Overview", "Evidence", "Relationships", "Detection"].map((t) => (
                   <button
                     key={t}
                     className={tab === t ? "active" : ""}
@@ -548,7 +549,7 @@ export function DetailDrawer({
                       Verify the NVD advisory <ExternalLink size={14} />
                     </a>
                   </>
-                ) : tab === "Relationships" ? (
+                ) : tab === "Evidence" ? <EvidencePanel vulnerability={v} /> : tab === "Relationships" ? (
                   <>
                     <h3>From adversary to affected package</h3>
                     <p className="muted small">

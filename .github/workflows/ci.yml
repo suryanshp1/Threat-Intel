@@ -16,8 +16,11 @@ jobs:
         with: {workspaces: backend}
       - run: npm --prefix frontend ci
       - run: cargo fmt --manifest-path backend/Cargo.toml --all --check
+      - run: npm --prefix frontend audit --audit-level=moderate
+      - run: node scripts/audit-dependencies.mjs
       - run: npm test
       - run: cargo build --manifest-path backend/Cargo.toml --locked
+      - run: node scripts/test-database-tls.mjs
       - run: npm run setup
       - run: node scripts/test-production.mjs
       - run: npm run build

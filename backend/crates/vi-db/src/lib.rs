@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use deadpool_postgres::{Manager, Pool};
+use deadpool_postgres::Pool;
+mod identity;
+mod tls;
 use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::OnceCell;
@@ -17,6 +19,8 @@ pub struct Database {
 pub struct Batch {
     pub vulnerabilities: Vec<Value>,
     pub entities: Vec<(String, String, Value)>,
+    /// Atomically replace these entity kinds for this source after a complete import.
+    pub replace_entity_kinds: Vec<String>,
 }
 impl Database {
     pub fn new() -> Self {
@@ -42,7 +46,7 @@ impl Database {
                     .ok_or("DATABASE_URL is required")?
                     .parse()
                     .map_err(|e: tokio_postgres::Error| e.to_string())?;
-                Pool::builder(Manager::new(config, tokio_postgres::NoTls))
+                Pool::builder(tls::manager(config)?)
                     .max_size(16)
                     .build()
                     .map_err(|e| e.to_string())
@@ -67,6 +71,22 @@ impl Database {
                 ))
                 .await
                 .map_err(|e| format!("{e:?}"))?;
+            transaction
+                .batch_execute(include_str!(
+                    "../../../migrations/0003_knowledge_sources.sql"
+                ))
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            transaction
+                .batch_execute(include_str!(
+                    "../../../migrations/0004_security_controls.sql"
+                ))
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            transaction
+                .batch_execute(include_str!("../../../migrations/0005_identity_audit.sql"))
+                .await
+                .map_err(|e| format!("{e:?}"))?;
             transaction.commit().await.map_err(|e| format!("{e:?}"))?;
             for cp in empty_store().checkpoints {
                 client.execute("INSERT INTO ingestion_checkpoints(source_name,data) VALUES($1,$2) ON CONFLICT DO NOTHING",&[&cp["source_name"].as_str().unwrap(),&cp]).await.map_err(|e|e.to_string())?;
@@ -75,6 +95,55 @@ impl Database {
             return Err("Production requires PostgreSQL DATABASE_URL".into());
         }
         Ok(())
+    }
+    pub async fn revoke_session(&self, hash: &str) -> Result<(), String> {
+        let expires = chrono::Utc::now() + chrono::Duration::hours(8);
+        if !self.persistent() {
+            return self.file_update(|s| {
+                s.revoked_sessions.retain(|r| {
+                    r["expires_at"]
+                        .as_str()
+                        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+                        .is_some_and(|t| t > chrono::Utc::now())
+                });
+                if !s.revoked_sessions.iter().any(|r| r["hash"] == hash) {
+                    s.revoked_sessions
+                        .push(json!({"hash":hash,"expires_at":expires.to_rfc3339()}));
+                }
+                Ok(())
+            });
+        }
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM session_revocations WHERE expires_at<=now()",
+            &[],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO session_revocations(session_hash,expires_at) VALUES($1,now()+interval '8 hours') ON CONFLICT(session_hash) DO UPDATE SET expires_at=excluded.expires_at", &[&hash]).await.map_err(|e|e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+    pub async fn session_revoked(&self, hash: &str) -> Result<bool, String> {
+        if !self.persistent() {
+            return Ok(self.file_read()?.revoked_sessions.iter().any(|r| {
+                r["hash"] == hash
+                    && r["expires_at"]
+                        .as_str()
+                        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+                        .is_some_and(|t| t > chrono::Utc::now())
+            }));
+        }
+        Ok(self
+            .client()
+            .await?
+            .query_opt(
+                "SELECT 1 FROM session_revocations WHERE session_hash=$1 AND expires_at>now()",
+                &[&hash],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some())
     }
     pub async fn ready(&self) -> bool {
         if self.persistent() {
@@ -218,6 +287,9 @@ impl Database {
                         s.vulnerabilities.push(record)
                     }
                 }
+                for kind in &batch.replace_entity_kinds {
+                    entities_mut(s, kind)?.retain(|v| v["source"] != source);
+                }
                 for (kind, id, data) in batch.entities {
                     let rows = entities_mut(s, &kind)?;
                     if let Some(i) = rows
@@ -256,6 +328,14 @@ impl Database {
             let v = merge_record(old.as_ref(), &patch)?;
             let data = serde_json::to_value(&v).map_err(|e| format!("{e:?}"))?;
             tx.execute("INSERT INTO vulnerabilities(id,data,priority_score,cvss,epss_score,published,ssvc_decision,seen_wild,is_zeroday,ecosystem,vendor) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO UPDATE SET data=excluded.data,priority_score=excluded.priority_score,cvss=excluded.cvss,epss_score=excluded.epss_score,published=excluded.published,ssvc_decision=excluded.ssvc_decision,seen_wild=excluded.seen_wild,is_zeroday=excluded.is_zeroday,ecosystem=excluded.ecosystem,vendor=excluded.vendor,updated_at=now()",&[&v.id,&data,&(v.priority_score as i16),&v.cvss,&v.epss_score,&v.published,&v.ssvc_decision,&v.seen_wild,&v.is_zeroday,&v.ecosystem,&v.vendor]).await.map_err(|e|e.to_string())?;
+        }
+        for kind in &batch.replace_entity_kinds {
+            tx.execute(
+                "DELETE FROM intelligence_entities WHERE source=$1 AND kind=$2",
+                &[&source, &kind],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         }
         for (kind, id, data) in batch.entities {
             tx.execute("INSERT INTO intelligence_entities(kind,id,source,data) VALUES($1,$2,$3,$4) ON CONFLICT(kind,id,source) DO UPDATE SET data=CASE WHEN excluded.kind='patches' THEN excluded.data || jsonb_build_object('cves',(SELECT jsonb_agg(DISTINCT x) FROM jsonb_array_elements(COALESCE(intelligence_entities.data->'cves','[]'::jsonb)||COALESCE(excluded.data->'cves','[]'::jsonb)) x)) ELSE excluded.data END,updated_at=now()",&[&kind,&id,&source,&data]).await.map_err(|e|e.to_string())?;
@@ -334,6 +414,36 @@ impl Database {
             .map(|r| r.get(0))
             .collect())
     }
+    /// Bounded keyset scan for catalog-scoped enrichment workers.
+    pub async fn ids_after(&self, after: &str, limit: usize) -> Result<Vec<String>, String> {
+        if limit == 0 || limit > 100 {
+            return Err("ID page limit must be between 1 and 100".into());
+        }
+        if !self.persistent() {
+            let mut ids: Vec<_> = self
+                .file_read()?
+                .vulnerabilities
+                .into_iter()
+                .map(|v| v.id)
+                .filter(|id| id.as_str() > after)
+                .collect();
+            ids.sort();
+            ids.truncate(limit);
+            return Ok(ids);
+        }
+        Ok(self
+            .client()
+            .await?
+            .query(
+                "SELECT id FROM vulnerabilities WHERE id > $1 ORDER BY id LIMIT $2",
+                &[&after, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
     pub async fn get(&self, id: &str) -> Result<Option<Vulnerability>, String> {
         if !self.persistent() {
             return Ok(self
@@ -352,6 +462,205 @@ impl Database {
             .map_err(|e| format!("{e:?}"))?
             .map(|r| serde_json::from_value(r.get(0)).map_err(|e| e.to_string()))
             .transpose()
+    }
+    pub async fn knowledge(&self, id: &str) -> Result<Option<Value>, String> {
+        if !self.persistent() {
+            let store = self.file_read()?;
+            return Ok(store
+                .weaknesses
+                .into_iter()
+                .chain(store.categories)
+                .find(|v| v["id"] == id));
+        }
+        Ok(self.client().await?.query_opt(
+            "SELECT data FROM intelligence_entities WHERE kind IN ('weaknesses','categories') AND id=$1 ORDER BY source LIMIT 1",
+            &[&id],
+        ).await.map_err(|e| e.to_string())?.map(|r| r.get(0)))
+    }
+    pub async fn entity_page(&self, kinds: &[&str], q: &Value) -> Result<Value, String> {
+        let name = q["name"].as_str().unwrap_or("").to_lowercase();
+        let cve = q["cve"].as_str();
+        let ecosystem = q["ecosystem"].as_str().unwrap_or("");
+        let limit = q["limit"].as_u64().unwrap_or(100).clamp(1, 100) as usize;
+        let skip = q["skip"].as_u64().unwrap_or(0).min(10000) as usize;
+        if !self.persistent() {
+            let mut store = self.file_read()?;
+            let mut rows = Vec::new();
+            for kind in kinds {
+                rows.extend(entities_mut(&mut store, kind)?.clone());
+            }
+            rows.retain(|v| {
+                v["id"]
+                    .as_str()
+                    .or_else(|| v["name"].as_str())
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .contains(&name)
+                    && (ecosystem.is_empty() || v["ecosystem"] == ecosystem)
+                    && cve.is_none_or(|id| {
+                        v["cves_exploited"]
+                            .as_array()
+                            .is_some_and(|a| a.contains(&json!(id)))
+                    })
+            });
+            rows.sort_by_key(|v| {
+                (
+                    v["id"].as_str().unwrap_or("").to_string(),
+                    v["source"].as_str().unwrap_or("").to_string(),
+                )
+            });
+            let total = rows.len();
+            return Ok(
+                json!({"results":rows.into_iter().skip(skip).take(limit).collect::<Vec<_>>(),"total":total}),
+            );
+        }
+        let kinds: Vec<String> = kinds.iter().map(|s| s.to_string()).collect();
+        let c = self.client().await?;
+        let predicate="kind=ANY($1) AND strpos(lower(COALESCE(data->>'id',data->>'name','')),$2)>0 AND ($3::text IS NULL OR data->'cves_exploited' ? $3) AND ($4='' OR data->>'ecosystem'=$4)";
+        let total: i64 = c
+            .query_one(
+                &format!("SELECT count(*) FROM intelligence_entities WHERE {predicate}"),
+                &[&kinds, &name, &cve, &ecosystem],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .get(0);
+        let rows:Vec<Value>=c.query(&format!("SELECT data FROM intelligence_entities WHERE {predicate} ORDER BY id,source LIMIT $5 OFFSET $6"),&[&kinds,&name,&cve,&ecosystem,&(limit as i64),&(skip as i64)]).await.map_err(|e|e.to_string())?.iter().map(|r|r.get(0)).collect();
+        Ok(json!({"results":rows,"total":total}))
+    }
+    pub async fn product_page(&self, q: &Value) -> Result<Value, String> {
+        let name = q["name"].as_str().unwrap_or("").to_lowercase();
+        let ecosystem = q["ecosystem"].as_str().unwrap_or("");
+        let limit = q["limit"].as_u64().unwrap_or(100).clamp(1, 100) as i64;
+        let skip = q["skip"].as_u64().unwrap_or(0).min(10000) as i64;
+        if !self.persistent() {
+            let store = self.file_read()?;
+            let mut rows = store.products;
+            for v in store.vulnerabilities {
+                if !v.purl.is_empty() || !v.cpe.is_empty() {
+                    rows.push(json!({"name":v.product,"vendor":v.vendor,"ecosystem":v.ecosystem,"purl":v.purl,"cpe":v.cpe.first().cloned().unwrap_or_default(),"affected_version_range":v.affected_version,"fixed_version":v.fixed_version,"cve_id":v.id,"priority_score":v.priority_score,"is_malicious_package":v.malicious,"provenance":v.provenance}));
+                }
+            }
+            rows.retain(|v| {
+                (ecosystem.is_empty() || v["ecosystem"] == ecosystem)
+                    && format!("{} {} {} {}", v["name"], v["vendor"], v["purl"], v["cpe"])
+                        .to_lowercase()
+                        .contains(&name)
+            });
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|v| seen.insert(format!("{}:{}", v["cve_id"], v["purl"])));
+            let total = rows.len();
+            return Ok(
+                json!({"results":rows.into_iter().skip(skip as usize).take(limit as usize).collect::<Vec<_>>(),"total":total}),
+            );
+        }
+        let cte="WITH candidates AS (SELECT data FROM intelligence_entities WHERE kind='products' UNION ALL SELECT jsonb_build_object('name',data->'product','vendor',data->'vendor','ecosystem',data->'ecosystem','purl',data->'purl','cpe',COALESCE(data->'cpe'->0,'\"\"'::jsonb),'affected_version_range',data->'affected_version','fixed_version',data->'fixed_version','cve_id',id,'priority_score',priority_score,'is_malicious_package',data->'malicious','provenance',data->'provenance') FROM vulnerabilities WHERE COALESCE(data->>'purl','')<>'' OR jsonb_array_length(COALESCE(data->'cpe','[]'))>0), matches AS (SELECT DISTINCT ON(COALESCE(data->>'cve_id',''),COALESCE(data->>'purl','')) data FROM candidates WHERE strpos(lower(concat_ws(' ',data->>'name',data->>'vendor',data->>'purl',data->>'cpe')),$1)>0 AND ($2='' OR data->>'ecosystem'=$2) ORDER BY COALESCE(data->>'cve_id',''),COALESCE(data->>'purl','')) ";
+        let c = self.client().await?;
+        let total: i64 = c
+            .query_one(
+                &format!("{cte} SELECT count(*) FROM matches"),
+                &[&name, &ecosystem],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .get(0);
+        let rows:Vec<Value>=c.query(&format!("{cte} SELECT data FROM matches ORDER BY data->>'cve_id',data->>'purl' LIMIT $3 OFFSET $4"),&[&name,&ecosystem,&limit,&skip]).await.map_err(|e|e.to_string())?.iter().map(|r|r.get(0)).collect();
+        Ok(json!({"results":rows,"total":total}))
+    }
+    pub async fn entity_links(&self, kind: &str, id: &str) -> Result<Value, String> {
+        let mut rows: Vec<Value> = if !self.persistent() {
+            self.entities(kind)
+                .await?
+                .into_iter()
+                .filter(|v| v["cve_id"] == id || v["source_ref"] == id || v["target_ref"] == id)
+                .take(101)
+                .collect()
+        } else {
+            self.client().await?.query("SELECT data FROM intelligence_entities WHERE kind=$1 AND (data->>'cve_id'=$2 OR data->>'source_ref'=$2 OR data->>'target_ref'=$2) ORDER BY id,source LIMIT 101",&[&kind,&id]).await.map_err(|e|e.to_string())?.iter().map(|r|r.get(0)).collect()
+        };
+        let truncated = rows.len() > 100;
+        rows.truncate(100);
+        Ok(json!({"results":rows,"truncated":truncated}))
+    }
+    pub async fn patch_candidates(&self, id: &str) -> Result<Vec<Value>, String> {
+        let rows: Vec<Value> = if !self.persistent() {
+            self.entities("patches")
+                .await?
+                .into_iter()
+                .filter(|v| {
+                    v["id"] == id
+                        || v["supersedes"]
+                            .as_array()
+                            .is_some_and(|a| a.contains(&json!(id)))
+                })
+                .take(201)
+                .collect()
+        } else {
+            self.client().await?.query("SELECT data FROM intelligence_entities WHERE kind='patches' AND (data->>'id'=$1 OR data->'supersedes' ? $1) ORDER BY id,source LIMIT 201",&[&id]).await.map_err(|e|e.to_string())?.iter().map(|r|r.get(0)).collect()
+        };
+        if rows.len() > 200 {
+            return Err("Patch graph exceeds query budget".into());
+        }
+        Ok(rows)
+    }
+    pub async fn vex_page(&self, limit: usize, skip: usize) -> Result<Value, String> {
+        let limit = limit.clamp(1, 100);
+        let skip = skip.min(10000);
+        let mut rows: Vec<Value> = if !self.persistent() {
+            self.file_read()?
+                .vex
+                .into_iter()
+                .rev()
+                .skip(skip)
+                .take(limit + 1)
+                .collect()
+        } else {
+            self.client()
+                .await?
+                .query(
+                    "SELECT data FROM vex_documents ORDER BY created_at DESC,id LIMIT $1 OFFSET $2",
+                    &[&((limit + 1) as i64), &(skip as i64)],
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|r| r.get(0))
+                .collect()
+        };
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        Ok(json!({"results":rows,"truncated":truncated}))
+    }
+    pub async fn vex_for_purls(&self, purls: &[String]) -> Result<Vec<Value>, String> {
+        if purls.len() > 1000 {
+            return Err("Too many VEX product queries".into());
+        }
+        let rows: Vec<Value> = if !self.persistent() {
+            self.file_read()?
+                .vex
+                .into_iter()
+                .filter(|d| {
+                    d["statements"].as_array().is_some_and(|s| {
+                        s.iter().any(|s| {
+                            s["products"].as_array().is_some_and(|p| {
+                                p.iter().any(|p| {
+                                    p["@id"]
+                                        .as_str()
+                                        .is_some_and(|id| purls.iter().any(|v| v == id))
+                                })
+                            })
+                        })
+                    })
+                })
+                .take(1001)
+                .collect()
+        } else {
+            self.client().await?.query("SELECT data FROM vex_documents WHERE EXISTS(SELECT 1 FROM jsonb_array_elements(COALESCE(data->'statements','[]')) s CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s->'products','[]')) p WHERE p->>'@id'=ANY($1)) ORDER BY created_at,id LIMIT 1001",&[&purls]).await.map_err(|e|e.to_string())?.iter().map(|r|r.get(0)).collect()
+        };
+        if rows.len() > 1000 {
+            return Err("VEX applicability candidates exceed budget".into());
+        }
+        Ok(rows)
     }
     pub async fn entities(&self, kind: &str) -> Result<Vec<Value>, String> {
         if !self.persistent() {
@@ -398,6 +707,21 @@ impl Database {
         }
         let mut c = self.client().await?;
         let tx = c.transaction().await.map_err(|e| format!("{e:?}"))?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,1))",
+            &[&id],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let before: Option<Value> = tx
+            .query_opt(
+                "SELECT data FROM vex_documents WHERE id=$1 FOR UPDATE",
+                &[&id],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|r| r.get(0));
+        tx.execute("INSERT INTO vex_revisions(document_id,subject,before_document,after_document) VALUES($1,$2,$3,$4)", &[&id,&subject,&before,&doc]).await.map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO vex_documents(id,data) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET data=excluded.data,created_at=now()",&[&id,&doc]).await.map_err(|e|e.to_string())?;
         tx.execute(
             "INSERT INTO audit_events(action,subject,detail) VALUES('vex.write',$1,$2)",
@@ -408,7 +732,7 @@ impl Database {
         tx.commit().await.map_err(|e| format!("{e:?}"))?;
         Ok(())
     }
-    pub async fn enqueue(&self, source: &str) -> Result<Value, String> {
+    pub async fn enqueue(&self, source: &str, subject: &str) -> Result<Value, String> {
         if !vi_core::SOURCES.iter().any(|(s, _)| *s == source) {
             return Err("Unknown source".into());
         }
@@ -417,10 +741,23 @@ impl Database {
                 "Ingestion jobs require PostgreSQL; use vi-worker --once in file mode".into(),
             );
         }
-        let c = self.client().await?;
-        let r=c.query_opt("INSERT INTO ingestion_jobs(source_name) VALUES($1) ON CONFLICT DO NOTHING RETURNING id",&[&source]).await.map_err(|e|e.to_string())?;
-        Ok(json!({"queued":r.is_some(),"id":r.map(|r|r.get::<_,i64>(0))}))
+        let mut c = self.client().await?;
+        let tx = c.transaction().await.map_err(|e| e.to_string())?;
+        let row=tx.query_opt("INSERT INTO ingestion_jobs(source_name) VALUES($1) ON CONFLICT DO NOTHING RETURNING id",&[&source]).await.map_err(|e|e.to_string())?;
+        let result = json!({"queued":row.is_some(),"id":row.map(|r|r.get::<_,i64>(0))});
+        tx.execute(
+            "INSERT INTO audit_events(action,subject,detail) VALUES('ingest.enqueue',$1,$2)",
+            &[
+                &subject,
+                &json!({"source":source,"queued":result["queued"]}),
+            ],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(result)
     }
+
     pub async fn queued(&self) -> Result<Vec<(i64, String)>, String> {
         if !self.persistent() {
             return Ok(vec![]);
@@ -479,6 +816,7 @@ impl Database {
         )
     }
     pub async fn query(&self, f: &Value) -> Result<Value, String> {
+        vi_core::validate_query(f)?;
         if !self.persistent() {
             return query_file(self.file_read()?.vulnerabilities, f);
         }
@@ -612,6 +950,8 @@ fn entities_mut<'a>(s: &'a mut Store, kind: &str) -> Result<&'a mut Vec<Value>, 
         "rules" => Ok(&mut s.rules),
         "relationships" => Ok(&mut s.relationships),
         "products" => Ok(&mut s.products),
+        "weaknesses" => Ok(&mut s.weaknesses),
+        "categories" => Ok(&mut s.categories),
         _ => Err("Unknown entity kind".into()),
     }
 }
@@ -752,4 +1092,164 @@ fn stats_for(v: &[Vulnerability], sources: Vec<Value>) -> Value {
         }
     }
     json!({"total":v.len(),"kev":v.iter().filter(|v|v.seen_wild).count(),"zerodays":v.iter().filter(|v|v.is_zeroday).count(),"exploits":v.iter().filter(|v|v.exploit_available).count(),"high_priority":v.iter().filter(|v|v.priority_score>=700).count(),"decisions":decisions,"sources":sources,"mode":"Source-backed intelligence","snapshot":v.iter().map(|v|&v.ingested_at).max(),"activity":activity.into_iter().map(|(month,(total,kev))|json!({"month":month,"total":total,"kev":kev})).collect::<Vec<_>>()})
+}
+
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+    #[tokio::test]
+    async fn evidence_and_checkpoint_roundtrip_with_bounded_id_scan() {
+        let path =
+            std::env::temp_dir().join(format!("sentinel-evidence-{}.json", uuid::Uuid::new_v4()));
+        let db = Database {
+            path: path.clone(),
+            url: None,
+            ..Database::new()
+        };
+        let evidence = json!({"source":"Debian Security Tracker","distribution":"Debian","release":"bookworm",
+            "product":"example","fixed_versions":["1:2.0~rc1-3+deb12u1"],
+            "provenance":{"url":"https://example.test/feed","retrieved_at":"2026-10-21T00:00:00Z","sha256":"first"}});
+        for id in ["CVE-2099-1002", "CVE-2099-1000", "CVE-2099-1001"] {
+            db.apply("Debian Security Tracker", Batch { vulnerabilities:vec![json!({"id":id,
+                "remediation_evidence":[evidence],"poc_references":[{"url":"https://github.com/example/research","verification":"unverified"}]})],
+                ..Default::default() }, json!({"source_name":"Debian Security Tracker","cursor":id})).await.unwrap();
+        }
+        let mut changed_page = evidence.clone();
+        changed_page["provenance"]["retrieved_at"] = json!("2026-10-22T00:00:00Z");
+        changed_page["provenance"]["sha256"] = json!("second");
+        db.apply(
+            "Debian Security Tracker",
+            Batch {
+                vulnerabilities: vec![
+                    json!({"id":"CVE-2099-1000","remediation_evidence":[changed_page]}),
+                ],
+                ..Default::default()
+            },
+            json!({"source_name":"Debian Security Tracker","cursor":"committed"}),
+        )
+        .await
+        .unwrap();
+        let reopened = Database {
+            path: path.clone(),
+            url: None,
+            ..Database::new()
+        };
+        let v = reopened.get("CVE-2099-1000").await.unwrap().unwrap();
+        assert_eq!(v.remediation_evidence.len(), 1);
+        assert_eq!(
+            v.remediation_evidence[0]["fixed_versions"][0],
+            "1:2.0~rc1-3+deb12u1"
+        );
+        assert!(!v.exploit_available && !v.seen_wild);
+        assert_eq!(
+            reopened.ids_after("CVE-2099-1000", 1).await.unwrap(),
+            vec!["CVE-2099-1001"]
+        );
+        assert!(reopened.ids_after("", 101).await.is_err());
+        assert_eq!(
+            reopened
+                .checkpoints()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|p| p["source_name"] == "Debian Security Tracker")
+                .unwrap()["cursor"],
+            "committed"
+        );
+        assert!(reopened
+            .apply(
+                "Debian Security Tracker",
+                Batch {
+                    vulnerabilities: vec![
+                        json!({"id":"CVE-2099-1000","title":"Must roll back"}),
+                        json!({"id":"invalid"})
+                    ],
+                    ..Default::default()
+                },
+                json!({"source_name":"Debian Security Tracker","cursor":"must-not-advance"})
+            )
+            .await
+            .is_err());
+        assert_ne!(
+            reopened.get("CVE-2099-1000").await.unwrap().unwrap().title,
+            "Must roll back"
+        );
+        assert_eq!(
+            reopened
+                .checkpoints()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|p| p["source_name"] == "Debian Security Tracker")
+                .unwrap()["cursor"],
+            "committed"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn taxonomy_refresh_replaces_only_its_source_and_retains_last_good_snapshot() {
+        let path =
+            std::env::temp_dir().join(format!("sentinel-knowledge-{}.json", uuid::Uuid::new_v4()));
+        let db = Database {
+            path: path.clone(),
+            url: None,
+            ..Database::new()
+        };
+        let entry = |source: &str, id: &str| {
+            (
+                "categories".into(),
+                id.into(),
+                json!({"id":id,"source":source}),
+            )
+        };
+        db.apply(
+            "other",
+            Batch {
+                entities: vec![entry("other", "other-category")],
+                ..Default::default()
+            },
+            json!({}),
+        )
+        .await
+        .unwrap();
+        for id in ["old", "new"] {
+            db.apply(
+                "OWASP Top 10",
+                Batch {
+                    entities: vec![entry("OWASP Top 10", id)],
+                    replace_entity_kinds: vec!["categories".into()],
+                    ..Default::default()
+                },
+                json!({"source_name":"OWASP Top 10","edition":id}),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db.knowledge("old").await.unwrap().is_none());
+        assert!(db.knowledge("new").await.unwrap().is_some());
+        assert!(db.knowledge("other-category").await.unwrap().is_some());
+        let error = db
+            .apply(
+                "OWASP Top 10",
+                Batch {
+                    entities: vec![("invalid-kind".into(), "bad".into(), json!({}))],
+                    replace_entity_kinds: vec!["categories".into()],
+                    ..Default::default()
+                },
+                json!({}),
+            )
+            .await;
+        assert!(error.is_err());
+        assert!(db.knowledge("new").await.unwrap().is_some());
+        assert_eq!(
+            db.checkpoints()
+                .await
+                .unwrap()
+                .iter()
+                .find(|v| v["source_name"] == "OWASP Top 10")
+                .unwrap()["edition"],
+            "new"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

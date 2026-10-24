@@ -44,7 +44,7 @@ impl Search {
         let mut parser = QueryParser::for_index(&self.index, vec![self.text]);
         parser.set_conjunction_by_default();
         let (query, _) = parser.parse_query_lenient(q);
-        let docs = searcher.search(&query, &TopDocs::with_limit(100_000))?;
+        let docs = searcher.search(&query, &TopDocs::with_limit(100_000).order_by_score())?;
         let mut ids = Vec::new();
         for (_, addr) in docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
@@ -53,5 +53,21 @@ impl Search {
             }
         }
         Ok(ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn upgraded_search_collector_retains_text_and_id_lookup() {
+        let records = vec![Vulnerability {
+            id: "CVE-2099-1000".into(),
+            title: "Parser fixture".into(),
+            ..Default::default()
+        }];
+        let search = Search::new(&records).unwrap();
+        assert_eq!(search.find("parser").unwrap(), vec!["CVE-2099-1000"]);
+        assert_eq!(search.find("CVE-2099").unwrap(), vec!["CVE-2099-1000"]);
     }
 }

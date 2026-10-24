@@ -33,6 +33,8 @@ The silent recording walks through the intelligence overview, searches for CVE-2
 
 Missing scores, dates, attribution, and remediation stay unknown. A missing finding is not evidence that a product is safe. Saved views and watchlists are local to your browser.
 
+New to the workspace? Choose **Start tour** in the welcome invitation or **User tour** in the header for an eight-screen introduction. Dismissal is saved in this browser, and the guide can be replayed anytime. Starting it changes screens, so save any in-progress form input first. See [user tour behavior](docs/user-tour.md).
+
 <details>
 <summary>More screenshots: threat actors and the SBOM workbench</summary>
 
@@ -132,23 +134,36 @@ For development, Vite proxies API requests directly to Axum. For container deplo
 | Source | Imported evidence |
 |---|---|
 | CISA KEV | Known exploitation, dates added/due, and ransomware evidence |
-| NVD | CVE descriptions, source CVSS vectors, CPEs, and references |
+| NIST NVD | CVE descriptions, source CVSS vectors, CPEs, CWE mappings, and explicitly tagged patch links |
+| CVE List V5 | Direct CNA/ADP assertions, source scores, affected structures and published/rejected record status; recent incremental coverage |
+| Debian Security Tracker / Ubuntu USN | Distribution/release-scoped package remediation; Ubuntu associations retain notice-level scope |
+| Trickest CVE index | Unverified community PoC/research references for the ingested catalog; no code execution |
+| MITRE CWE | Weakness definitions, upstream mitigations, and classification metadata |
+| OWASP Top 10:2025 | Risk categories and explicit CWE mappings from the official documents |
 | FIRST EPSS | Exploit probability enrichment for ingested CVEs |
 | MITRE ATT&CK | Enterprise groups, techniques, and source relationships |
 | RansomLook | Public ransomware group catalog |
 | OSV / GitHub Advisory Database | Advisory records, affected package ranges, and fixes |
 | CISA Vulnrichment | Source assessments and enrichment for existing CVEs |
 | Microsoft MSRC | Recent security updates, KB/product mappings, and source-supplied supersedence |
+| Apache HTTP Server | HTML advisories for 2.4 with release status and affected-version evidence |
+| Apache Tomcat | HTML advisories for 9.x, 10.x, and 11.x with branch-scoped fixes and commit links |
+| OpenSSL | HTML advisories with affected ranges, source severity, and fix references |
+| curl / libcurl | Official advisory JSON with affected/fixed events and fix commits |
 | Nuclei / Sigma / Suricata | Detection artifacts explicitly mapped to CVEs |
 | Vendor CSAF / OpenVEX | Local imports; configuration and a publisher verification process are required |
 
 Records preserve upstream URLs, retrieval timestamps, and document hashes. Optional `NVD_API_KEY` and `GITHUB_TOKEN` credentials improve quotas. NVD starts with a recent 30-day modified window by default; configure `VI_NVD_START` before the first import to begin historical backfill. Counts and source status do not imply a complete historical corpus.
 
+CVE responses include `weaknesses`, `weakness_evidence`, `patch_links`, and product-scoped `remediation_evidence`. Vendor scrapers refresh daily from fixed official URLs; they do not follow arbitrary advisory links. Read definitions with `/api/knowledge/CWE-79` or `/api/knowledge/OWASP-A01:2025`; existing relationship endpoints connect CVEs → CWEs → OWASP categories. Knowledge is context, not evidence that a specific product is affected or fixed. See the [source expansion plan](docs/data-source-expansion.md).
+
+The CVE drawer’s **Evidence** tab shows publisher and collection dates separately, release-scoped remediation, and unverified community references. New collectors have explicit incremental and historical coverage limits; see the [expansion plan](docs/intelligence-expansion-plan.md) and [source operations](OPERATIONS.md#direct-cve-records-distribution-fixes-and-poc-references).
+
 See [source attribution and upstream terms](SOURCES.md). The project license does not relicense imported feeds, advisory text, rule contents, or third-party dependencies.
 
 ## API and exports
 
-The API accepts the operator bearer token or an authenticated browser session. Interactive documentation is available at `/scalar`, with generated OpenAPI at `/api-docs/openapi.json`. Scalar loads its viewer from an external CDN.
+The API accepts the operator bearer token, a scoped client bearer credential, or an authenticated browser session. A self-hosted API reference is available at `/scalar`, with OpenAPI at `/api-docs/openapi.json`; it loads no CDN scripts. See [security upgrade and scoped client setup](OPERATIONS.md#security-upgrade-and-scoped-clients).
 
 With `VI_API_TOKEN` already set in your shell:
 
@@ -172,7 +187,7 @@ SBOM analysis requires upstream OSV access. Unknown or unversioned components pr
 
 ## MCP for AI clients
 
-Connect an MCP client to `http://127.0.0.1:8080/api/mcp` and supply `Authorization: Bearer <VI_API_TOKEN>`. Keep `npm run dev` running for local development. The **API & integrations** screen provides copyable configuration. If initialization reports `connection refused`, start Sentinel and reconnect the client; running only the database and Valkey containers is insufficient. See [MCP troubleshooting](MCP.md#connection-troubleshooting).
+Connect an MCP client to `http://127.0.0.1:8080/api/mcp` and supply `Authorization: Bearer <SCOPED_CLIENT_TOKEN>` using an expiring `read` credential. Keep `npm run dev` running for local development. The **API & integrations** screen provides copyable configuration. If initialization reports `connection refused`, start Sentinel and reconnect the client; running only the database and Valkey containers is insufficient. See [MCP troubleshooting](MCP.md#connection-troubleshooting).
 
 Nine read-only tools cover vulnerability search, CVE evidence, detection rules, relationships, actor and product search, KB lookup, dataset statistics, and source status. A Node stdio bridge supports clients that launch a local process:
 
@@ -180,7 +195,7 @@ Nine read-only tools cover vulnerability search, CVE evidence, detection rules, 
 node /absolute/path/to/threat-intel/scripts/mcp-stdio.mjs
 ```
 
-Set `VI_MCP_URL` and `VI_API_TOKEN` in the client environment. Supported protocol revisions are `2025-03-26`, `2025-06-18`, and `2025-11-25`. Remote clients need a reachable HTTPS deployment. OAuth-only clients require an authentication gateway; the shared operator token is not an MCP-scoped credential.
+Set `VI_MCP_URL` and `VI_API_TOKEN` in the client environment. Supported protocol revisions are `2025-03-26`, `2025-06-18`, and `2025-11-25`. Remote clients need a reachable HTTPS deployment. OAuth-only clients require an authentication gateway; the operator token remains an administrator credential; use a scoped client key for integrations.
 
 See [MCP setup, tools, and compatibility](MCP.md).
 
@@ -201,7 +216,7 @@ For public HTTPS, configure DNS and `VI_PUBLIC_HOST` in `.env`:
 docker compose -f compose.yaml -f compose.production.yaml up -d --build
 ```
 
-Caddy obtains TLS certificates and proxies the frontend. Production uses Secure session cookies and requires a strong operator token, PostgreSQL, and Valkey. This is a **single-operator application**; SSO, RBAC, tenant isolation, and high availability are not implemented.
+Caddy obtains TLS certificates and proxies the frontend. Production uses Secure session cookies and requires a strong operator recovery token, PostgreSQL, and Valkey. Optional OIDC SSO supports locally assigned reader, analyst, auditor and administrator roles. The **Audit & access** screen manages approvals, activity history and SSO session revocation. Verified PostgreSQL TLS is available for remote databases. See [identity, audit and database TLS setup](OPERATIONS.md#database-tls-oidc-sign-in-and-audit-management). Tenant isolation and high availability are not implemented.
 
 Read [Operations](OPERATIONS.md) for backups, restores, credential rotation, monitoring, and source troubleshooting. `docker compose down` retains volumes; adding `--volumes` deletes stored data.
 
@@ -240,7 +255,7 @@ docs/images/    Real app screenshots used in this README
 
 ## Project status and contributing
 
-Sentinel is under active development. The included deployment and verification work does not constitute a security certification or a guarantee of corpus completeness. Signed publisher VEX, broader historical coverage, scoped MCP credentials, full TAXII, SSO/RBAC, and capacity testing remain on the [roadmap](ROADMAP.md). See the [implementation record](IMPLEMENTATION.md) for detailed scope.
+Sentinel is under active development. The included deployment and verification work does not constitute a security certification or a guarantee of corpus completeness. Signed publisher VEX, broader historical coverage, full TAXII, tenant isolation, and capacity testing remain on the [roadmap](ROADMAP.md). See the [implementation record](IMPLEMENTATION.md) for detailed scope.
 
 Contributions to adapters, evidence quality, tests, accessibility, documentation, and operations are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), follow the [Code of Conduct](CODE_OF_CONDUCT.md), and use the issue and pull request templates. For vulnerabilities in Sentinel itself, follow [SECURITY.md](SECURITY.md) instead of posting exploit details publicly.
 

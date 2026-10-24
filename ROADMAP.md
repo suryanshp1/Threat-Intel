@@ -9,19 +9,21 @@ This roadmap describes opportunities, not delivery commitments. Discuss substant
 - CVE investigation, actor and ransomware profiles, affected package and KB lookup.
 - Versioned-PURL SBOM analysis with live OSV matching and persisted OpenVEX statements.
 - REST, GraphQL, OpenAPI, exports, and nine read-only MCP tools over HTTP or the stdio bridge.
+- Expiring scoped client credentials, durable logout revocation, bounded request/analysis budgets, and VEX revision history.
+- Verified PostgreSQL TLS, optional OIDC SSO with local RBAC, and an audit/user/session management screen.
 - A responsive React workspace, local preferences, Docker Compose, and an HTTPS deployment overlay.
 
 ## Reliability and evidence quality
 
 - Expand deterministic adapter fixtures and failure/recovery coverage.
 - Improve historical backfill visibility and source coverage reporting.
-- Optimize entity queries and benchmark a larger catalog.
+- Benchmark bounded entity queries against a larger catalog.
 - Exercise backup/restore, upgrades, and failure recovery on a repeatable schedule.
 - Expand accessibility and browser regression coverage.
 
 ## Integrations and AI clients
 
-- Scoped, revocable MCP credentials and per-client audit identity.
+- Per-client usage reporting and richer credential-management UI.
 - OAuth discovery and authorization for hosted AI connectors.
 - Newer MCP protocol revisions and a tested client compatibility matrix.
 - Bounded SBOM tools with explicit outbound network controls.
@@ -36,7 +38,8 @@ This roadmap describes opportunities, not delivery commitments. Discuss substant
 
 ## Deployment evolution
 
-- SSO, RBAC, multiple users, and tenant isolation.
+- Tenant isolation, IdP group/SCIM integration, and provider-wide logout.
+- External immutable audit export and retention management.
 - High availability, monitoring integrations, and capacity testing.
 - Release artifacts, supply-chain review, and a versioned support policy.
 
