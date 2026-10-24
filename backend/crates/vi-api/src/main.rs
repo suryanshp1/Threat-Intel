@@ -750,6 +750,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/admin/sessions/{id}",
             axum::routing::delete(management::revoke),
         )
+        .route("/stats", get(stats))
         .route("/stats/", get(stats))
         .route("/vulnerabilities", post(filter))
         .route("/vulnerabilities/{id}", get(detail))
@@ -757,7 +758,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v2/vulnerabilities/filter", post(filter))
         .route("/v2/vulnerabilities/{id}/rules", get(rules))
         .route("/latest/zerodays", get(zerodays))
+        .route("/search", get(search_handler))
         .route("/search/", get(search_handler))
+        .route("/search/cpe", get(cpe))
         .route("/search/cpe/", get(cpe))
         .route("/affected-product", post(products))
         .route("/threat-actors", post(actors))
@@ -854,4 +857,60 @@ async fn metrics(State(app): State<App>) -> Response {
         body,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn router_handles_stats_with_and_without_trailing_slash() {
+        let token = "test-token-at-least-32-chars-long-abc";
+        std::env::set_var("VI_API_TOKEN", token);
+        let db = vi_db::Database::new();
+        let security = security::Security::new().unwrap();
+        let metrics_collector = Arc::new(telemetry::Metrics::default());
+        let app = App {
+            db,
+            security,
+            buckets: Default::default(),
+            metrics: metrics_collector.clone(),
+            requests: Arc::new(tokio::sync::Semaphore::new(16)),
+            analyses: Arc::new(tokio::sync::Semaphore::new(2)),
+            exports: Arc::new(tokio::sync::Semaphore::new(2)),
+        };
+        let api = Router::new()
+            .route("/stats", get(stats))
+            .route("/stats/", get(stats))
+            .route_layer(middleware::from_fn_with_state(app.clone(), security::gate));
+        let router = Router::new().nest("/api", api).with_state(app);
+
+        // Request without trailing slash must not return 404
+        let res_no_slash = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res_no_slash.status(), StatusCode::NOT_FOUND);
+
+        // Request with trailing slash must not return 404
+        let res_with_slash = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats/")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res_with_slash.status(), StatusCode::NOT_FOUND);
+    }
 }
