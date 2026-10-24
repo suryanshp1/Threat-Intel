@@ -7,4 +7,4 @@ license = "GPL-3.0-only"
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-utoipa = "5"
+utoipa = "6"

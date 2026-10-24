@@ -15,7 +15,7 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4", "v5"] }
 tower-http = { version = "0.6", features = ["fs", "trace", "limit"] }
 async-graphql = "7"
-utoipa = "5"
+utoipa = "6"
 vi-ingest.workspace = true
 redis = { version = "0.27", features = ["tokio-comp"] }
 sha2 = "0.10"
