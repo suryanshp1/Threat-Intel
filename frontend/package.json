@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.0",
-    "@tanstack/react-table": "^8.21.3",
+    "@tanstack/react-table": "^9.3.1",
     "@xyflow/react": "^12.8.5",
     "lucide-react": "^0.468.0",
     "react": "^19.2.0",
